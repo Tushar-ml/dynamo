@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 export PYTHONHASHSEED=0
 
 # Common configuration
-MODEL="Qwen/Qwen3-0.6B"
+MODEL="google/gemma-4-31b-it"
 BLOCK_SIZE=64
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
@@ -34,17 +34,18 @@ python -m dynamo.frontend \
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT1:-8081} \
 CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm \
     --model $MODEL \
-    --block-size $BLOCK_SIZE \
-    --enforce-eager \
+    --block-size $BLOCK_SIZE --attention-backend GEMMA4_FLASH_ATTN \
+    --max-model-len 32000 --language-model-only --gpu-memory-utilization 0.95 --quantization fp8 \
+    --speculative-config='{"model": "google/gemma-4-31b-it-assistant", "num_speculative_tokens": 4}' \
     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' &
 
-DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT2:-8082} \
-VLLM_NIXL_SIDE_CHANNEL_PORT=20097 \
-CUDA_VISIBLE_DEVICES=1 python3 -m dynamo.vllm \
-    --model $MODEL \
-    --block-size $BLOCK_SIZE \
-    --enforce-eager \
-    --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20081","enable_kv_cache_events":true}' &
+# DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT2:-8082} \
+# VLLM_NIXL_SIDE_CHANNEL_PORT=20097 \
+# CUDA_VISIBLE_DEVICES=1 python3 -m dynamo.vllm \
+#     --model $MODEL \
+#     --block-size $BLOCK_SIZE \
+#     --enforce-eager \
+#     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20081","enable_kv_cache_events":true}' &
 
 # Exit on first worker failure; kill 0 in the EXIT trap tears down the rest
 wait_any_exit

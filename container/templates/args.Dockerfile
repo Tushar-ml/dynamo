@@ -98,6 +98,11 @@ ARG MAX_JOBS={{ context.vllm.max_jobs }}
 ARG FLASHINF_REF={{ context.vllm.flashinf_ref }}
 {% endif %}
 ARG VLLM_OMNI_REF={{ context.vllm.vllm_omni_ref }}
+ARG VLLM_REPO={{ context.vllm.vllm_repo }}
+ARG VLLM_REF={{ context.vllm.vllm_ref }}
+ARG VLLM_CUDA_VERSION={{ context.vllm.vllm_cuda_version }}
+ARG VLLM_USE_PRECOMPILED={{ context.vllm.vllm_use_precompiled }}
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT={{ context.vllm.vllm_precompiled_wheel_commit }}
 
 {% if device == "cuda" -%}
 # If left blank, then we will fallback to vLLM defaults

@@ -7,8 +7,9 @@ Implementation of vLLM KV cache manager protocol.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from kvbm.utils import is_dyn_runtime_enabled
@@ -16,6 +17,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -31,6 +34,55 @@ if TYPE_CHECKING:
 # )
 
 from kvbm.vllm_integration.rust import KvConnectorWorker as RustKvConnectorWorker
+
+# Layer types whose KV blocks carry the full prefix (matches cache_info.py).
+_MAIN_ATTENTION_LAYER_TYPES = frozenset(
+    {
+        "full_attention",
+        "mla_attention",
+        "sink_full_attention",
+    }
+)
+
+
+def _layer_type_for_name(layer_name: str, vllm_config: "VllmConfig") -> Optional[str]:
+    hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    layer_types = getattr(hf_config, "layer_types", None) if hf_config else None
+    if not layer_types:
+        return None
+    layer_idx = extract_layer_index(layer_name)
+    if layer_idx < 0 or layer_idx >= len(layer_types):
+        return None
+    return layer_types[layer_idx]
+
+
+def _select_main_attention_shape_group(
+    shape_groups: dict[torch.Size, list[str]],
+    filtered: dict[str, torch.Tensor],
+    vllm_config: "VllmConfig",
+) -> torch.Size:
+    """Pick the KV shape group that should back prefix-cache routing.
+
+    Hybrid models (e.g. Gemma4 sliding + full attention) expose multiple tensor
+    shapes. Prefer the group that stores full-prefix attention KV, not the
+    largest group by layer count (Gemma4 has many sliding but few full layers).
+    """
+
+    def main_attention_layer_count(shape: torch.Size) -> int:
+        return sum(
+            1
+            for name in shape_groups[shape]
+            if _layer_type_for_name(name, vllm_config) in _MAIN_ATTENTION_LAYER_TYPES
+        )
+
+    if any(main_attention_layer_count(shape) > 0 for shape in shape_groups):
+        return max(shape_groups, key=main_attention_layer_count)
+
+    # Fallback: larger per-block tensors (e.g. Gemma4 global_head_dim vs head_dim).
+    return max(
+        shape_groups,
+        key=lambda shape: filtered[shape_groups[shape][0]].numel(),
+    )
 
 
 @dataclass
@@ -92,7 +144,7 @@ class KvConnectorWorker:
 
     # Worker
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(self, kv_caches: dict[str, Any]):
         """
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
@@ -103,11 +155,54 @@ class KvConnectorWorker:
 
         cache_config = self.vllm_config.cache_config
 
+        # --- Hybrid model filtering ---
+        # Step 1: drop list-valued entries (Mamba/SSM states are list[Tensor])
+        filtered: dict[str, torch.Tensor] = {
+            name: t for name, t in kv_caches.items() if isinstance(t, torch.Tensor)
+        }
+        skipped_non_tensor = len(kv_caches) - len(filtered)
+        if skipped_non_tensor:
+            logger.warning(
+                "KVBM: skipping %d non-tensor KV cache layers (Mamba/SSM). "
+                "Only attention layers will be registered.",
+                skipped_non_tensor,
+            )
+
+        if not filtered:
+            logger.warning(
+                "KVBM: no tensor KV cache layers found; skipping registration."
+            )
+            self.events = {}
+            return
+
+        # Step 2: if multiple shapes exist, keep the main-attention group
+        shape_groups: dict[torch.Size, list[str]] = {}
+        for name, tensor in filtered.items():
+            shape_groups.setdefault(tensor.shape, []).append(name)
+
+        if len(shape_groups) > 1:
+            main_shape = _select_main_attention_shape_group(
+                shape_groups, filtered, self.vllm_config
+            )
+            n_excluded = sum(len(v) for s, v in shape_groups.items() if s != main_shape)
+            logger.warning(
+                "KVBM: hybrid model with %d KV shape groups. "
+                "Registering main-attention shape %s (%d layers), excluding %d layers.",
+                len(shape_groups),
+                tuple(main_shape),
+                len(shape_groups[main_shape]),
+                n_excluded,
+            )
+            filtered = {n: t for n, t in filtered.items() if t.shape == main_shape}
+
+        kv_caches_filtered = filtered
+        # --- end filtering ---
+
         # Create ordered list of (layer_name, tensor) tuples sorted by layer index
         ordered_kv_caches = [
             (layer_name, tensor)
             for layer_name, tensor in sorted(
-                kv_caches.items(), key=lambda item: extract_layer_index(item[0])
+                kv_caches_filtered.items(), key=lambda item: extract_layer_index(item[0])
             )
         ]
 
@@ -130,12 +225,6 @@ class KvConnectorWorker:
         # Get first tensor to extract common properties
         first_tensor = ordered_kv_caches[0][1]
         shape = first_tensor.shape
-
-        # Validate all tensors have same shape
-        if not all(t.shape == shape for t in kv_caches.values()):
-            raise NotImplementedError(
-                "Hybrid models with different KV cache shapes are not supported yet."
-            )
 
         page_size = cache_config.block_size
         use_mla = getattr(self.vllm_config.model_config, "use_mla", False)
@@ -223,6 +312,8 @@ class KvConnectorWorker:
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        if layer_name not in self.events:
+            return  # layer excluded from KVBM (different shape group or SSM)
         self.events[layer_name].record(torch.cuda.current_stream())
         self._connector.save_kv_layer(layer_name, kv_layer)
 
