@@ -130,6 +130,7 @@ class VllmProcessor:
         routed_engine: RoutedEngine,
         block_size: int = 16,
         enable_auto_tool_choice: bool = False,
+        tool_parser_name: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.input_processor = input_processor
@@ -137,6 +138,7 @@ class VllmProcessor:
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
         self.reasoning_parser_class = reasoning_parser_class
+        self.tool_parser_name = tool_parser_name
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
         self.enable_auto_tool_choice = enable_auto_tool_choice
@@ -499,6 +501,8 @@ class VllmProcessor:
                     tool_parser=tool_parser,
                     reasoning_parser_class=self.reasoning_parser_class,
                     chat_template_kwargs=chat_template_kwargs,
+                    stream_response=bool(request.get("stream", True)),
+                    tool_parser_name=self.tool_parser_name,
                 )
 
             # StreamingPostProcessor keeps delta/tool/reasoning parser state, so
@@ -842,6 +846,7 @@ class EngineFactory:
             routed_engine,
             block_size=block_size,
             enable_auto_tool_choice=enable_auto_tool_choice,
+            tool_parser_name=tool_parser_name,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none

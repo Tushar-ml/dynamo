@@ -24,11 +24,7 @@ print_launch_banner "Launching Aggregated + KV Routing (2 GPUs)" "$MODEL" "$HTTP
 # --dyn-chat-processor vllm on the frontend. See docs/backends/vllm/vllm-chat-processor.md.
 python -m dynamo.frontend \
     --router-mode kv \
-    --router-reset-states \
-    --dyn-chat-processor vllm \
-    --enable-auto-tool-choice \
-    --tool-call-parser gemma4 \
-    --reasoning-parser gemma4 &
+    --router-reset-states &
 
 # run workers
 # --enforce-eager is added for quick deployment. for production use, need to remove this flag
@@ -44,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm \
     --max-model-len 250000 --language-model-only --gpu-memory-utilization 0.95 --quantization fp8 \
     --speculative-config='{"model": "google/gemma-4-26b-a4b-it-assistant", "num_speculative_tokens": 4}' \
     --prefix-warmup-file "https://gist.githubusercontent.com/Tushar-ml/d9a8fa4f076f1585b19ebfa7d5c5ca8d/raw/312628f74aec1711e34357488aad6dc2d7692fe4/warmup.json"  \
-    --prefix-warmup-parallel \
+    --prefix-warmup-parallel --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4 \
     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' &
 
 # DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT2:-8082} \
