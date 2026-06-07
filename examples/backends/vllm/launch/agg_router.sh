@@ -16,13 +16,19 @@ MODEL="google/gemma-4-26b-a4b-it"
 BLOCK_SIZE=64
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
-print_launch_banner "Launching Aggregated + KV Routing (1 GPUs)" "$MODEL" "$HTTP_PORT"
+print_launch_banner "Launching Aggregated + KV Routing (2 GPUs)" "$MODEL" "$HTTP_PORT"
 
 # run frontend + KV router
 # dynamo.frontend accepts either --http-port flag or DYN_HTTP_PORT env var (defaults to 8000)
+# vLLM-native parsers (--tool-call-parser, --reasoning-parser) require
+# --dyn-chat-processor vllm on the frontend. See docs/backends/vllm/vllm-chat-processor.md.
 python -m dynamo.frontend \
     --router-mode kv \
-    --router-reset-states --dyn-chat-processor vllm --tool-call-parser gemma4 &
+    --router-reset-states \
+    --dyn-chat-processor vllm \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 &
 
 # run workers
 # --enforce-eager is added for quick deployment. for production use, need to remove this flag
