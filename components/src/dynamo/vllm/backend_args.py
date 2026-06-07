@@ -11,7 +11,11 @@ from dynamo.common.configuration.config_base import ConfigBase
 from dynamo.common.configuration.groups.frontend_decoding_args import (
     add_frontend_decoding_arg,
 )
-from dynamo.common.configuration.utils import add_argument, add_negatable_bool_argument
+from dynamo.common.configuration.utils import (
+    add_argument,
+    add_negatable_bool_argument,
+    nullable_int,
+)
 
 from . import __version__
 from .constants import DisaggregationMode, EmbeddingTransferMode
@@ -246,6 +250,42 @@ class DynamoVllmArgGroup(ArgGroup):
             ),
         )
 
+        # Prefix warmup (decode/aggregated workers only)
+        add_argument(
+            g,
+            flag_name="--prefix-warmup-file",
+            env_var="DYN_VLLM_PREFIX_WARMUP_FILE",
+            default=None,
+            help=(
+                "Path or http(s) URL to a JSON list of chat-completion-style "
+                "warmup requests. Each decode/aggregated worker runs them "
+                "through its engine before registration to prime prefix/KV "
+                "cache and JIT-compile attention kernels. Failures abort "
+                "startup."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--prefix-warmup-count",
+            env_var="DYN_VLLM_PREFIX_WARMUP_COUNT",
+            default=None,
+            arg_type=nullable_int,
+            help=(
+                "When set, only run the first N entries from "
+                "--prefix-warmup-file."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--prefix-warmup-parallel",
+            env_var="DYN_VLLM_PREFIX_WARMUP_PARALLEL",
+            default=False,
+            help=(
+                "Run prefix warmup entries concurrently instead of "
+                "sequentially."
+            ),
+        )
+
 
 # @dataclass()
 class DynamoVllmConfig(ConfigBase):
@@ -288,6 +328,11 @@ class DynamoVllmConfig(ConfigBase):
     benchmark_warmup_iterations: int = 5
     benchmark_output_path: str = "/tmp/benchmark_results.json"
     benchmark_timeout: int = 300
+
+    # Prefix warmup (decode/aggregated workers)
+    prefix_warmup_file: Optional[str] = None
+    prefix_warmup_count: Optional[int] = None
+    prefix_warmup_parallel: bool = False
 
     def validate(self) -> None:
         """Validate vLLM wrapper configuration."""

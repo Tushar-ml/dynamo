@@ -86,6 +86,42 @@ def setup_sglang_engine_factory(
     )
 
 
+def _get_vllm_flexible_parser():
+    try:
+        from vllm.utils import FlexibleArgumentParser
+    except ImportError:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    return FlexibleArgumentParser
+
+
+def _parse_vllm_frontend_flags(
+    unknown: list[str],
+) -> tuple[Optional[Namespace], list[str]]:
+    """Extract vLLM FrontendArgs (--tool-call-parser, ...)."""
+    if not unknown:
+        return None, unknown
+    try:
+        from vllm.entrypoints.openai.cli_args import FrontendArgs
+    except ModuleNotFoundError:
+        return None, unknown
+
+    parser = _get_vllm_flexible_parser()(add_help=False)
+    FrontendArgs.add_cli_args(parser)
+    consumed = {
+        action.dest
+        for action in parser._actions
+        if action.option_strings and action.dest != "help"
+    }
+    flags, remaining = parser.parse_known_args(unknown)
+    provided = any(
+        getattr(flags, dest, None) not in (None, False, [], "")
+        for dest in consumed
+    )
+    if not provided:
+        return None, unknown
+    return flags, remaining
+
+
 def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespace]]:
     """Parse command-line arguments for the Dynamo frontend.
 
@@ -108,18 +144,17 @@ def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespac
     vllm_flags = None
     sglang_flags = None
 
+    _, unknown = _parse_vllm_frontend_flags(unknown)
+
     # parse extra vllm flags using vllm native parser.
     if config.chat_processor == "vllm":
         try:
-            from vllm.utils import FlexibleArgumentParser
-        except ImportError:
-            try:
-                from vllm.utils.argparse_utils import FlexibleArgumentParser
-            except ModuleNotFoundError:
-                logger.exception(
-                    "Flag '--chat-processor vllm' requires vllm be installed."
-                )
-                sys.exit(1)
+            FlexibleArgumentParser = _get_vllm_flexible_parser()
+        except ModuleNotFoundError:
+            logger.exception(
+                "Flag '--chat-processor vllm' requires vllm be installed."
+            )
+            sys.exit(1)
         try:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.entrypoints.openai.cli_args import FrontendArgs

@@ -76,7 +76,10 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git
 rm -rf /var/lib/apt/lists/*
 
-git clone --depth 1 --branch "${VLLM_REF}" "${VLLM_REPO}" /tmp/vllm-fork-src
+# VLLM_REF may be a branch name or a commit SHA.
+git clone "${VLLM_REPO}" /tmp/vllm-fork-src
+git -C /tmp/vllm-fork-src fetch --depth 1 origin "${VLLM_REF}"
+git -C /tmp/vllm-fork-src checkout FETCH_HEAD
 
 VLLM_PATCHES_DIR="${VLLM_PATCHES_DIR:-/tmp/vllm-fork-patches}"
 if [ -d "${VLLM_PATCHES_DIR}" ]; then
@@ -101,6 +104,26 @@ echo "Installing vLLM fork with VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED} var
 if [ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]; then
   echo "VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}"
 fi
+
+# --no-build-isolation: setup.py runs in the runtime env, so install build deps
+# explicitly (pyproject [build-system] requires are not applied automatically).
+BUILD_REQS="/tmp/vllm-fork-src/requirements/build/cuda.txt"
+if [ -f "${BUILD_REQS}" ]; then
+  echo "Installing vLLM fork build requirements from ${BUILD_REQS}"
+  uv pip install "${PIP_TARGET[@]}" \
+    --index-url "${TORCH_INDEX}" \
+    --extra-index-url https://pypi.org/simple \
+    -r "${BUILD_REQS}"
+else
+  echo "No ${BUILD_REQS}; installing minimal vLLM build requirements"
+  uv pip install "${PIP_TARGET[@]}" \
+    --index-url "${TORCH_INDEX}" \
+    --extra-index-url https://pypi.org/simple \
+    cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel \
+    jinja2 regex build "protobuf>=5.29.6"
+fi
+# Some forks import setuptools_rust in setup.py without listing it in build deps.
+uv pip install "${PIP_TARGET[@]}" setuptools_rust
 
 # Python-only install: download precompiled .so from wheels.vllm.ai (no CMake build).
 uv pip install "${PIP_TARGET[@]}" \

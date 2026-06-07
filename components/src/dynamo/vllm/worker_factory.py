@@ -36,6 +36,7 @@ from .handlers import (
 )
 from .health_check import VllmHealthCheckPayload, VllmPrefillHealthCheckPayload
 from .multimodal_handlers import EncodeWorkerHandler
+from .prefix_warmup import run_decode_prefix_warmup
 from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
@@ -498,6 +499,13 @@ class WorkerFactory:
             handler._benchmark_results = await _wait_and_load_benchmark(
                 bench_cfg, vllm_config
             )
+
+        await run_decode_prefix_warmup(
+            engine_client,
+            vllm_config,
+            config,
+            default_sampling_params,
+        )
 
         # What the worker is advertising itself as, and what other worker it needs to serve traffic.
         if config.disaggregation_mode == DisaggregationMode.DECODE:
