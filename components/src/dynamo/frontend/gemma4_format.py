@@ -19,6 +19,13 @@ _EMPTY_THINKING_PATTERNS = (
     CHANNEL_START + "thought\r\n" + CHANNEL_END,
 )
 
+_ORPHAN_THOUGHT_LABEL_PREFIXES = (
+    "__thought\n",
+    "__thought\r\n",
+    "__thought__\n",
+    "__thought__\r\n",
+)
+
 _TH_WORD = "thought"
 _LEN_TH = len(_TH_WORD)
 _TH_PAIR = _TH_WORD * 2
@@ -179,6 +186,11 @@ def strip_thought_shard_echoes(text: str) -> str:
     return "".join(rebuilt)
 
 
+def _is_underscore_separator_line(line: str) -> bool:
+    stripped = line.strip()
+    return len(stripped) >= 3 and all(c == "_" for c in stripped)
+
+
 def _may_contain_gemma4_control_leak(text: str) -> bool:
     cf = text.casefold()
     return (
@@ -189,6 +201,65 @@ def _may_contain_gemma4_control_leak(text: str) -> bool:
         or TOOL_CALL_END in text
         or STRING_DELIM in text
     )
+
+
+def _may_need_content_cleaning(text: str) -> bool:
+    return (
+        _may_contain_gemma4_control_leak(text)
+        or "__thought" in text
+        or any(_is_underscore_separator_line(line) for line in text.splitlines())
+    )
+
+
+def _strip_orphan_thought_labels(text: str) -> str:
+    s = text
+    while True:
+        old = s
+        for prefix in _ORPHAN_THOUGHT_LABEL_PREFIXES:
+            if s.startswith(prefix):
+                s = s[len(prefix) :]
+        if s.startswith("__thought"):
+            rest = s[len("__thought") :]
+            if rest.startswith("__"):
+                rest = rest[2:]
+            if not rest or rest.startswith("\n") or rest.startswith("\r\n"):
+                s = rest.lstrip("\r\n")
+        if s == old:
+            break
+    return s
+
+
+def _strip_underscore_separator_lines(text: str) -> str:
+    if "_" not in text:
+        return text
+    rebuilt: list[str] = []
+    for raw_line in text.splitlines(keepends=True):
+        nl = ""
+        core = raw_line
+        if raw_line.endswith("\n"):
+            nl = "\n"
+            core = raw_line[:-1]
+        if _is_underscore_separator_line(core):
+            continue
+        rebuilt.append(core + nl)
+    return "".join(rebuilt).lstrip("\n")
+
+
+def _strip_composite_empty_thinking(text: str) -> str:
+    """Remove ``thought\\n<|channel>thought\\n<channel|>`` only at line boundaries."""
+    composite = THOUGHT_PREFIX + CHANNEL_START + THOUGHT_PREFIX + CHANNEL_END
+    s = text
+    while True:
+        if s.startswith(composite):
+            s = s[len(composite) :]
+            continue
+        needle = "\n" + composite
+        idx = s.find(needle)
+        if idx != -1:
+            s = s[:idx] + s[idx + 1 :]
+            continue
+        break
+    return s
 
 
 def _strip_leaked_tool_grammar(text: str) -> str:
@@ -203,13 +274,12 @@ def strip_leaked_empty_thinking(text: str) -> str:
     """Remove echoed empty thinking channels and orphan control-token prefixes."""
     if not text:
         return text
-    if not _may_contain_gemma4_control_leak(text):
+    if not _may_need_content_cleaning(text):
         return text
     s = text
 
-    composite = THOUGHT_PREFIX + CHANNEL_START + THOUGHT_PREFIX + CHANNEL_END
-    if composite in s:
-        s = s.replace(composite, "")
+    s = _strip_orphan_thought_labels(s)
+    s = _strip_composite_empty_thinking(s)
 
     for pattern in _EMPTY_THINKING_PATTERNS:
         if pattern in s:
@@ -235,6 +305,8 @@ def strip_leaked_empty_thinking(text: str) -> str:
 
     s = _strip_leaked_tool_grammar(s)
     s = strip_thought_shard_echoes(s)
+    s = _strip_orphan_thought_labels(s)
+    s = _strip_underscore_separator_lines(s)
     return s.lstrip("\n").strip()
 
 

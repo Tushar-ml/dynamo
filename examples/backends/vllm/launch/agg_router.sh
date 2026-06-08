@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 export PYTHONHASHSEED=0
 
 # Common configuration
-MODEL="google/gemma-4-26b-a4b-it"
+MODEL="RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
 BLOCK_SIZE=64
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
@@ -36,8 +36,9 @@ python -m dynamo.frontend \
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT1:-8081} \
 CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm \
     --model $MODEL \
-    --block-size $BLOCK_SIZE --attention-backend GEMMA4_FLASH_ATTN \
-    --max-model-len 250000 --language-model-only --gpu-memory-utilization 0.95 --quantization fp8 \
+    --block-size $BLOCK_SIZE --attention-backend GEMMA4_FLASH_ATTN --served-model-name google/gemma-4-26b-a4b-it \
+    --max-model-len 250000 --language-model-only --gpu-memory-utilization 0.95 \
+    --max-num-batched-tokens 16384 --max-num-seqs 16 --block-size 32 --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,80,96,128]}' \
     --speculative-config='{"model": "google/gemma-4-26b-a4b-it-assistant", "num_speculative_tokens": 4}' \
     --prefix-warmup-file "https://gist.githubusercontent.com/Tushar-ml/d9a8fa4f076f1585b19ebfa7d5c5ca8d/raw/312628f74aec1711e34357488aad6dc2d7692fe4/warmup.json"  \
     --prefix-warmup-parallel --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4 \

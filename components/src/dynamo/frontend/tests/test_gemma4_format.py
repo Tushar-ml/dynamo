@@ -19,6 +19,19 @@ def test_strip_leaked_empty_thinking():
     orphan = "thought\n<channel|>أعتذر"
     assert strip_leaked_empty_thinking(orphan) == "أعتذر"
 
+    assert (
+        strip_leaked_empty_thinking("__thought\nAll getting sometime this")
+        == "All getting sometime this"
+    )
+    assert (
+        strip_leaked_empty_thinking(
+            "__thought\n<|channel>thought\n<channel|>You're welcome."
+        )
+        == "You're welcome."
+    )
+    assert strip_leaked_empty_thinking("_________________\nHello there") == "Hello there"
+    assert strip_leaked_empty_thinking("thought\n_________________\nHi") == "Hi"
+
 
 def test_strip_thought_shard_echoes():
     assert strip_thought_shard_echoes("thoughtthought") == ""

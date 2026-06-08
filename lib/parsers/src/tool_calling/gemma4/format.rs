@@ -19,6 +19,14 @@ const EMPTY_THINKING_PATTERNS: &[&str] = &[
     "<|channel>thought\r\n<channel|>",
 ];
 
+/// Orphan role labels the model sometimes emits with ``enable_thinking: false``.
+const ORPHAN_THOUGHT_LABEL_PREFIXES: &[&str] = &[
+    "__thought\n",
+    "__thought\r\n",
+    "__thought__\n",
+    "__thought__\r\n",
+];
+
 /// Control tokens whose **proper prefixes** may appear as streaming tail fragments.
 const INCOMPLETE_TOKENS: &[&str] = &[
     CHANNEL_START,
@@ -223,6 +231,83 @@ fn may_contain_gemma4_control_leak(text: &str) -> bool {
         || text.contains(STRING_DELIM)
 }
 
+fn may_need_content_cleaning(text: &str) -> bool {
+    may_contain_gemma4_control_leak(text)
+        || text.contains("__thought")
+        || text.lines().any(is_underscore_separator_line)
+}
+
+fn is_underscore_separator_line(line: &str) -> bool {
+    let stripped = line.trim();
+    stripped.len() >= 3 && stripped.chars().all(|c| c == '_')
+}
+
+/// Remove ``thought\\n<|channel>thought\\n<channel|>`` only at line boundaries.
+fn strip_composite_empty_thinking(text: &str) -> String {
+    let composite = format!("{THOUGHT_PREFIX}{CHANNEL_START}{THOUGHT_PREFIX}{CHANNEL_END}");
+    let mut s = text.to_string();
+    loop {
+        if s.starts_with(&composite) {
+            s = s[composite.len()..].to_string();
+            continue;
+        }
+        let needle = format!("\n{composite}");
+        if let Some(idx) = s.find(&needle) {
+            s = format!("{}{}", &s[..idx], &s[idx + 1..]);
+            continue;
+        }
+        break;
+    }
+    s
+}
+
+/// Remove echoed ``__thought`` role labels (markdown-style channel corruption).
+fn strip_orphan_thought_labels(text: &str) -> String {
+    let mut s = text.to_string();
+    loop {
+        let old = s.clone();
+        for prefix in ORPHAN_THOUGHT_LABEL_PREFIXES {
+            if s.starts_with(prefix) {
+                s = s[prefix.len()..].to_string();
+            }
+        }
+        if let Some(rest) = s.strip_prefix("__thought") {
+            let rest = rest.strip_prefix("__").unwrap_or(rest);
+            if rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n") {
+                s = rest
+                    .trim_start_matches('\r')
+                    .trim_start_matches('\n')
+                    .to_string();
+            }
+        }
+        if s == old {
+            break;
+        }
+    }
+    s
+}
+
+/// Remove planning separator lines made of underscores only.
+fn strip_underscore_separator_lines(text: &str) -> String {
+    if !text.contains('_') {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for raw_line in text.split_inclusive('\n') {
+        let (core, nl) = if let Some(stripped) = raw_line.strip_suffix('\n') {
+            (stripped, "\n")
+        } else {
+            (raw_line, "")
+        };
+        if is_underscore_separator_line(core) {
+            continue;
+        }
+        out.push_str(core);
+        out.push_str(nl);
+    }
+    out.trim_start_matches('\n').to_string()
+}
+
 /// Remove orphaned Gemma4 tool-call grammar tokens from client-visible text.
 ///
 /// Does not strip ``<|tool_call>`` — that marker is handled by
@@ -242,16 +327,14 @@ pub(crate) fn strip_leaked_empty_thinking(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    if !may_contain_gemma4_control_leak(text) {
+    if !may_need_content_cleaning(text) {
         return text.to_string();
     }
 
     let mut s = text.to_string();
 
-    let composite = format!("{THOUGHT_PREFIX}{CHANNEL_START}{THOUGHT_PREFIX}{CHANNEL_END}");
-    if s.contains(&composite) {
-        s = s.replace(&composite, "");
-    }
+    s = strip_orphan_thought_labels(&s);
+    s = strip_composite_empty_thinking(&s);
 
     for pattern in EMPTY_THINKING_PATTERNS {
         if s.contains(pattern) {
@@ -284,6 +367,8 @@ pub(crate) fn strip_leaked_empty_thinking(text: &str) -> String {
 
     let s = strip_leaked_tool_grammar(&s);
     let s = strip_thought_shard_echoes(&s);
+    let s = strip_orphan_thought_labels(&s);
+    let s = strip_underscore_separator_lines(&s);
     s.trim_start_matches('\n').trim().to_string()
 }
 
@@ -505,6 +590,25 @@ mod tests {
 
         let arabic = "أعتذر جداً عن التأخير!";
         assert_eq!(strip_leaked_empty_thinking(arabic), arabic);
+
+        let orphan_label = "__thought\nAll getting sometime this";
+        assert_eq!(
+            strip_leaked_empty_thinking(orphan_label),
+            "All getting sometime this"
+        );
+
+        let composite_label =
+            "__thought\n<|channel>thought\n<channel|>You're welcome.";
+        assert_eq!(
+            strip_leaked_empty_thinking(composite_label),
+            "You're welcome."
+        );
+
+        let separators = "_________________\nHello there";
+        assert_eq!(strip_leaked_empty_thinking(separators), "Hello there");
+
+        let thought_then_sep = "thought\n_________________\nHi";
+        assert_eq!(strip_leaked_empty_thinking(thought_then_sep), "Hi");
     }
 
     #[test]
