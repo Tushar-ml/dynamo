@@ -1579,7 +1579,30 @@ impl OpenAIPreprocessor {
         // callers set enable_thinking=false. The reasoning parser is intentionally
         // skipped in that mode, so run it in sanitize-only mode to strip channel
         // control tokens from `content` without emitting `reasoning_content`.
+        // Check if tools are present and if we should apply jail.
+        // Computed here (before the gemma4 sanitize decision) because the
+        // thinking-disabled gemma4 channel sanitizer MUST be skipped when the
+        // jail runs: the jail has its own `gemma4_content_cleaner` that strips
+        // empty `<|channel>thought\n<channel|>` blocks AND extracts tool calls
+        // from the raw text. Running the sanitizer first would strip the bare
+        // `call:fn{...}` tool-call markup out of `content` before the jail's
+        // tool parser ever sees it, so no tool_call is emitted (the
+        // enable_thinking=false + tools regression).
+        let has_tools = request
+            .inner
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty());
+
+        // Determine if we should apply jail (do this before moving request)
+        let should_jail = Self::should_apply_tool_jail(
+            self.tool_call_parser.as_ref(),
+            request.inner.tool_choice.as_ref(),
+            has_tools,
+        )?;
+
         let should_sanitize_gemma4_leaked_channels = reasoning_disabled_by_request
+            && !should_jail
             && (Self::is_gemma4_parser(self.runtime_config.tool_call_parser.as_deref())
                 || Self::is_gemma4_parser(self.runtime_config.reasoning_parser.as_deref()));
 
@@ -1599,20 +1622,6 @@ impl OpenAIPreprocessor {
         } else {
             Box::pin(stream)
         };
-
-        // Check if tools are present and if we should apply jail
-        let has_tools = request
-            .inner
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty());
-
-        // Determine if we should apply jail (do this before moving request)
-        let should_jail = Self::should_apply_tool_jail(
-            self.tool_call_parser.as_ref(),
-            request.inner.tool_choice.as_ref(),
-            has_tools,
-        )?;
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
         let tool_definitions = request.inner.tools.as_ref().map(|tools| {
