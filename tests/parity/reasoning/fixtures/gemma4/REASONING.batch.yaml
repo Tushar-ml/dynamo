@@ -35,9 +35,17 @@ cases:
       vllm: *d_2
       sglang: *d_2
   REASONING.batch.3.b:
-    description: Open Gemma thought channel interrupted by downstream tool-call text is not configured
+    description: Open Gemma thought channel interrupted by tool-call markup
     ref: *upstream_ref
-    reason: Dynamo's Gemma reasoning parser has no downstream tool-call boundary while the thought channel is open; closed-channel handoff is covered by REASONING.batch.3.a.
+    model_text: |-
+      <|channel>thought
+      planning<|tool_call>call:get_weather{location:<|"|>SF<|"|>}<tool_call|>
+    expected:
+      dynamo: &d_open_tool
+        reasoning_text: planning
+        normal_text: <|tool_call>call:get_weather{location:<|"|>SF<|"|>}<tool_call|>
+      vllm: *d_open_tool
+      sglang: *d_open_tool
   REASONING.batch.2.c:
     description: Gemma reasoning followed by normal answer text
     ref: *upstream_ref
@@ -80,18 +88,17 @@ cases:
       vllm: *d_3
       sglang: *d_3
   REASONING.batch.4:
-    description: Dangling Gemma channel end marker extracts text before the marker as reasoning
+    description: Dangling Gemma channel end marker passes through as content
     ref: *upstream_ref
     model_text: normal<channel|>answer
     expected:
       dynamo: &d_4
-        reasoning_text: normal
-        normal_text: answer
+        reasoning_text: ''
+        normal_text: normal<channel|>answer
       vllm: *d_4
       sglang:
         reasoning_text: ''
         normal_text: normal<channel|>answer
-        reason: Dynamo treats the text before an unpaired end marker as reasoning (implicit-opener recovery, matching vLLM); SGLang enters reasoning only on an explicit start marker, so the dangling end marker and surrounding text stay in normal_text.
   REASONING.batch.5:
     description: Open thought channel without close treats suffix as reasoning
     ref: *upstream_ref
@@ -102,15 +109,14 @@ cases:
     expected:
       dynamo:
         reasoning_text: partial
-        normal_text: 'intro '
+        normal_text: ''
       vllm:
         reasoning_text: partial
         normal_text: ''
-        reason: vLLM drops text before an open Gemma reasoning channel.
       sglang:
         reasoning_text: intro partial
         normal_text: ''
-        reason: Dynamo keeps text before an unclosed reasoning channel as normal_text and the channel body as reasoning; SGLang strips the open marker in place and folds the entire prefix into reasoning_text.
+        reason: SGLang strips the open marker in place and folds the entire prefix into reasoning_text.
   REASONING.batch.2.e:
     description: Empty Gemma reasoning channel
     ref: *upstream_ref
@@ -151,29 +157,21 @@ cases:
       vllm: *d_8
       sglang: *d_8
   REASONING.batch.6.a:
-    description: Multiple reasoning spans are concatenated by Dynamo
+    description: Only the first Gemma reasoning span is extracted (vLLM/SGLang-aligned)
     ref: *upstream_ref
-    spec_ref: lib/parsers/REASONING_CASES.md; https://docs.vllm.ai/en/v0.21.0/api/vllm/reasoning/gemma4_reasoning_parser/; https://docs.nvidia.com/dynamo/dev/user-guides/reasoning/reasoning-parsing-dynamo
+    spec_ref: lib/parsers/REASONING_CASES.md; https://github.com/Tushar-ml/vllm/pull/5
     model_text: |-
       <|channel>thought
       first<channel|> middle <|channel>thought
       second<channel|> done
     expected:
-      dynamo:
-        reasoning_text: firstsecond
-        normal_text: ' middle  done'
-      vllm:
+      dynamo: &d_6a
         reasoning_text: first
         normal_text: |2-
            middle <|channel>thought
           second<channel|> done
-        reason: Multi-span reasoning is out-of-spec model output; Dynamo preserves all reasoning and non-reasoning text without leaking protocol markers, while vLLM leaves the later complete channel in normal_text.
-      sglang:
-        reasoning_text: first
-        normal_text: |2-
-           middle <|channel>thought
-          second<channel|> done
-        reason: Dynamo extracts every complete reasoning span and concatenates them; SGLang exits reasoning at the first end marker and leaves the later span, with its literal markers, in normal_text.
+      vllm: *d_6a
+      sglang: *d_6a
   REASONING.batch.6.b:
     description: Stray end marker after a complete reasoning span(unbalanced-tag)
     ref: dynamo

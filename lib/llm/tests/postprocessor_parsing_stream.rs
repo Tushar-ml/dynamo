@@ -569,6 +569,107 @@ async fn postprocessor_parsing_stream_nemotron_v3_enable_thinking_false_returns_
     assert_eq!(content, "This is plain content");
 }
 
+/// Gemma4 echoes empty thinking channels even when enable_thinking=false.
+/// With only --dyn-tool-call-parser gemma4 configured, the sanitizer path must
+/// strip control tokens from content without emitting reasoning_content.
+#[tokio::test]
+async fn postprocessor_parsing_stream_gemma4_enable_thinking_false_strips_empty_channels(
+) {
+    let preprocessor = build_preprocessor(None, Some("gemma4"));
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
+    request.chat_template_args = Some(
+        serde_json::from_value(serde_json::json!({
+            "enable_thinking": false
+        }))
+        .unwrap(),
+    );
+
+    let leak = "thought\n<|channel>thought\n<channel|>You're very welcome.";
+    let input_chunks = vec![mock_content_chunk(leak)];
+    let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false)
+        .expect("postprocessor_parsing_stream should build");
+
+    let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
+        output_stream.collect().await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for output in &output_chunks {
+        let Some(data) = output.data.as_ref() else {
+            continue;
+        };
+        for choice in &data.inner.choices {
+            if let Some(r) = &choice.delta.reasoning_content {
+                reasoning.push_str(r);
+            }
+            if let Some(c) = &choice.delta.content {
+                content.push_str(get_text(c));
+            }
+        }
+    }
+
+    assert_eq!(reasoning, "");
+    assert_eq!(content, "You're very welcome.");
+}
+
+/// Gemma4 suppress-CoT markers split across streaming chunks must never reach clients.
+#[tokio::test]
+async fn postprocessor_parsing_stream_gemma4_enable_thinking_false_strips_split_channels() {
+    let preprocessor = build_preprocessor(None, Some("gemma4"));
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
+    request.chat_template_args = Some(
+        serde_json::from_value(serde_json::json!({
+            "enable_thinking": false
+        }))
+        .unwrap(),
+    );
+
+    let chunks = [
+        "<|channel>",
+        "thought\n",
+        "<channel|>",
+        "<|channel>",
+        "Hi. ",
+    ];
+    let input_stream = stream::iter(
+        chunks
+            .into_iter()
+            .map(mock_content_chunk)
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false)
+        .expect("postprocessor_parsing_stream should build");
+
+    let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
+        output_stream.collect().await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for output in &output_chunks {
+        let Some(data) = output.data.as_ref() else {
+            continue;
+        };
+        for choice in &data.inner.choices {
+            if let Some(r) = &choice.delta.reasoning_content {
+                reasoning.push_str(r);
+            }
+            if let Some(c) = &choice.delta.content {
+                content.push_str(get_text(c));
+            }
+        }
+    }
+
+    assert_eq!(reasoning, "");
+    assert!(!content.contains("<|channel>"));
+    assert!(!content.contains("<channel|>"));
+    assert!(content.starts_with("Hi."));
+}
+
 /// vLLM parity: `chat_template_kwargs={"force_nonempty_content": true}` turns
 /// a leading `<think>...` response into normal content instead of reasoning.
 /// Dynamo checks this in the postprocessor because request flags are applied

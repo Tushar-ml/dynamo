@@ -453,6 +453,7 @@ pub fn try_tool_call_parse_gemma4(
                     "gemma4 strip (success): kept prefix before first <|tool_call>; dropped parsed-call(s) + any inter-call / trailing narration. preview={:?}",
                     preview
                 );
+                // strip_leaked_empty_thinking via clean_visible_prefix (vLLM PR #5 parity).
                 clean_visible_prefix(message[..idx].trim())
             }
             None => String::new(),

@@ -1575,12 +1575,23 @@ impl OpenAIPreprocessor {
         // Future Solution:
         // To address the limitation if needed in future: move this step before transform_postprocessor_stream and add new field of reasoning_content to the backend output
         // Use backend_output.reasoning_content field to fill out the deltas.
+        // Gemma 4 still echoes empty `<|channel>thought\n<channel|>` blocks even when
+        // callers set enable_thinking=false. The reasoning parser is intentionally
+        // skipped in that mode, so run it in sanitize-only mode to strip channel
+        // control tokens from `content` without emitting `reasoning_content`.
+        let should_sanitize_gemma4_leaked_channels = reasoning_disabled_by_request
+            && (Self::is_gemma4_parser(self.runtime_config.tool_call_parser.as_deref())
+                || Self::is_gemma4_parser(self.runtime_config.reasoning_parser.as_deref()));
+
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
             Box::pin(Self::parse_reasoning_content_from_stream(
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
                 prompt_injected_reasoning,
+                false,
             ))
+        } else if should_sanitize_gemma4_leaked_channels {
+            Box::pin(Self::sanitize_gemma4_leaked_content_from_stream(stream))
         } else if should_strip_disabled_reasoning_start {
             Box::pin(Self::strip_leading_reasoning_start_from_stream(
                 stream, "<think>",
@@ -2063,6 +2074,10 @@ impl OpenAIPreprocessor {
         )
     }
 
+    fn is_gemma4_parser(parser: Option<&str>) -> bool {
+        matches!(parser, Some("gemma4") | Some("gemma-4"))
+    }
+
     /// Check if reasoning parsing should be disabled based on per-request parameters.
     /// For kimi_k25: disabled when chat_template_args contains "thinking": false.
     /// For Nemotron force-reasoning aliases: disabled when chat_template_args
@@ -2139,10 +2154,73 @@ impl OpenAIPreprocessor {
     /// mode immediately — use this when the chat template already appended the
     /// reasoning start token (e.g., `<think>`) to the prompt, so the model's
     /// completion begins with thinking content without an explicit start tag.
+    /// Strip echoed Gemma4 channel/control tokens from streamed `content` when
+    /// `enable_thinking=false` disabled the full reasoning parser.
+    pub fn sanitize_gemma4_leaked_content_from_stream<S>(
+        stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        use dynamo_parsers::StreamingContentCleaner;
+
+        struct Gemma4SanitizeState {
+            stream: Pin<
+                Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+            >,
+            choices: HashMap<u32, Gemma4SanitizeChoiceState>,
+        }
+
+        struct Gemma4SanitizeChoiceState {
+            previous_text: String,
+            cleaner: StreamingContentCleaner,
+        }
+
+        let state = Gemma4SanitizeState {
+            stream: Box::pin(stream),
+            choices: HashMap::new(),
+        };
+
+        stream::unfold(state, move |mut state| async move {
+            if let Some(response) = state.stream.next().await {
+                let processed = response.map_data(|mut data| {
+                    for choice in data.inner.choices.iter_mut() {
+                        if let Some(ChatCompletionMessageContent::Text(delta_text)) =
+                            choice.delta.content.as_ref()
+                        {
+                            let choice_state = state
+                                .choices
+                                .entry(choice.index)
+                                .or_insert_with(|| Gemma4SanitizeChoiceState {
+                                    previous_text: String::new(),
+                                    cleaner: StreamingContentCleaner::new(),
+                                });
+                            let current_text =
+                                format!("{}{}", choice_state.previous_text, delta_text);
+                            let cleaned = choice_state.cleaner.pre_tool_content_delta(
+                                &choice_state.previous_text,
+                                &current_text,
+                                delta_text,
+                            );
+                            choice_state.previous_text = current_text;
+                            choice.delta.content = cleaned.map(ChatCompletionMessageContent::Text);
+                        }
+                    }
+                    Ok(data)
+                });
+                Some((processed, state))
+            } else {
+                None
+            }
+        })
+        .fuse()
+    }
+
     pub fn parse_reasoning_content_from_stream<S>(
         stream: S,
         parser_name: String,
         prompt_injected_reasoning: bool,
+        suppress_reasoning_output: bool,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -2161,39 +2239,48 @@ impl OpenAIPreprocessor {
             reasoning_parser: Some(reasoning_parser),
         };
 
-        stream::unfold(state, |mut state| async move {
-            if let Some(response) = state.stream.next().await {
-                // Process the response through reasoning parser if available
-                let processed_response = if let Some(ref mut parser) = state.reasoning_parser {
-                    response.map_data(|mut data| {
-                        // Process all choices, not just the first one
-                        for choice in data.inner.choices.iter_mut() {
-                            // Reasoning parsing only applies to text content
-                            if let Some(
-                                dynamo_protocols::types::ChatCompletionMessageContent::Text(text),
-                            ) = choice.delta.content.as_ref()
-                            {
-                                let parser_result =
-                                    parser.parse_reasoning_streaming_incremental(text, &[]);
+        stream::unfold(state, move |mut state| {
+            let suppress_reasoning_output = suppress_reasoning_output;
+            async move {
+                if let Some(response) = state.stream.next().await {
+                    // Process the response through reasoning parser if available
+                    let processed_response = if let Some(ref mut parser) = state.reasoning_parser {
+                        response.map_data(|mut data| {
+                            // Process all choices, not just the first one
+                            for choice in data.inner.choices.iter_mut() {
+                                // Reasoning parsing only applies to text content
+                                if let Some(
+                                    dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                        text,
+                                    ),
+                                ) = choice.delta.content.as_ref()
+                                {
+                                    let parser_result =
+                                        parser.parse_reasoning_streaming_incremental(text, &[]);
 
-                                // Update this specific choice with parsed content
-                                choice.delta.content = parser_result.get_some_normal_text().map(
-                                    dynamo_protocols::types::ChatCompletionMessageContent::Text,
-                                );
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                    // Update this specific choice with parsed content
+                                    choice.delta.content = parser_result.get_some_normal_text().map(
+                                        dynamo_protocols::types::ChatCompletionMessageContent::Text,
+                                    );
+                                    choice.delta.reasoning_content = if suppress_reasoning_output {
+                                        None
+                                    } else {
+                                        parser_result.get_some_reasoning()
+                                    };
+                                }
+                                // For multimodal content, pass through unchanged
                             }
-                            // For multimodal content, pass through unchanged
-                        }
-                        Ok(data)
-                    })
-                } else {
-                    // No reasoning parser configured, pass through unchanged
-                    response
-                };
+                            Ok(data)
+                        })
+                    } else {
+                        // No reasoning parser configured, pass through unchanged
+                        response
+                    };
 
-                Some((processed_response, state))
-            } else {
-                None
+                    Some((processed_response, state))
+                } else {
+                    None
+                }
             }
         })
         .fuse()

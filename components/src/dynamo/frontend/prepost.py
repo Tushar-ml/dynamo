@@ -22,7 +22,12 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils.async_utils import AsyncMicrobatchTokenizer
 
-from .gemma4_format import has_gemma4_tool_markup, strip_leaked_empty_thinking
+from .gemma4_format import (
+    StreamingContentCleaner,
+    has_gemma4_tool_markup,
+    strip_leaked_empty_thinking,
+    strip_tool_call_suffix,
+)
 from .gemma4_rust_fallback import (
     extract_gemma4_tool_calls_rust_sync,
     vllm_extraction_needs_rust_fallback,
@@ -282,6 +287,10 @@ class StreamingPostProcessor:
         self._gemma4_tools = tool_parser_name in ("gemma4", "gemma-4")
         self._non_streaming_buffer = ""
         self._thinking_disabled = thinking_disabled
+        self._use_prefix_content_cleaner = self._gemma4_tools or self._thinking_disabled
+        self._content_cleaner = (
+            StreamingContentCleaner() if self._use_prefix_content_cleaner else None
+        )
 
     @staticmethod
     def _merge_tool_call(
@@ -344,10 +353,26 @@ class StreamingPostProcessor:
     def _clean_visible_content(self, content: str | None) -> str | None:
         if not content:
             return content
-        if self._thinking_disabled or self._gemma4_tools:
-            cleaned = strip_leaked_empty_thinking(content)
+        if self._gemma4_tools or self._thinking_disabled:
+            cleaned = strip_tool_call_suffix(strip_leaked_empty_thinking(content)).strip()
             return cleaned if cleaned else None
         return content
+
+    def _streaming_content_delta(
+        self,
+        *,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> str | None:
+        if self._content_cleaner is not None:
+            return self._content_cleaner.pre_tool_content_delta(
+                previous_text,
+                current_text,
+                delta_text,
+            )
+        cleaned = self._clean_visible_content(delta_text)
+        return cleaned if cleaned else None
 
     @staticmethod
     def _compose_delta_message(
@@ -530,15 +555,30 @@ class StreamingPostProcessor:
         delta_text = output.text or ""
         delta: dict[str, Any] = {}
         if self._fast_plain_text:
+            current_text = self.previous_text + delta_text
             if delta_text:
+                cleaned = self._streaming_content_delta(
+                    previous_text=self.previous_text,
+                    current_text=current_text,
+                    delta_text=delta_text,
+                )
+                if not cleaned:
+                    if output.finish_reason:
+                        delta = {}
+                    else:
+                        self.previous_text = current_text
+                        return None
+                    self.previous_text = current_text
+                    return self._build_choice(output, delta)
                 delta = {
                     "role": "assistant",
-                    "content": delta_text,
+                    "content": cleaned,
                 }
             elif output.finish_reason:
                 delta = {}
             else:
                 return None
+            self.previous_text = current_text
             return self._build_choice(output, delta)
 
         current_text = self.previous_text + delta_text
@@ -552,7 +592,13 @@ class StreamingPostProcessor:
             )
 
         delta_message: DeltaMessage | None = DeltaMessage(
-            content=self._clean_visible_content(delta_text) if delta_text else None
+            content=self._streaming_content_delta(
+                previous_text=self.previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+            )
+            if delta_text
+            else None
         )
 
         # ------------------------------------------------------------------
@@ -696,7 +742,7 @@ class StreamingPostProcessor:
             if self.in_progress_tool_calls and self._is_control_only_content(content):
                 content = None
             if content:
-                delta["content"] = self._clean_visible_content(content)
+                delta["content"] = content
             if delta_message.reasoning:
                 delta["reasoning_content"] = delta_message.reasoning
             if self.in_progress_tool_calls:
