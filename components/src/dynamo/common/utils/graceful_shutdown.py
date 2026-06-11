@@ -12,7 +12,7 @@ from dynamo._core import DistributedRuntime
 logger = logging.getLogger(__name__)
 
 # TODO: make this using cli flag
-_DEFAULT_GRACE_PERIOD_SECS = 5.0
+_DEFAULT_GRACE_PERIOD_SECS = 60.0
 _DEFAULT_DRAIN_TIMEOUT_SECS = 30.0
 _DEFAULT_CLEANUP_TIMEOUT_SECS = 30.0
 _GRACE_PERIOD_ENV = "DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS"
