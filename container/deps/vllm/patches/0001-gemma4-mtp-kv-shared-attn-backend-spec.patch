@@ -18,7 +18,7 @@ diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runne
 index a30e927..78b6db7 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -6496,7 +6496,24 @@ class GPUModelRunner(
+@@ -6722,7 +6722,24 @@ class GPUModelRunner(
                  full_cls_name = attn_backend.full_cls_name()
                  layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                  if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -41,6 +41,6 @@ index a30e927..78b6db7 100644
 +                            layer_kv_cache_spec = (
 +                                layer_kv_cache_spec.kv_cache_specs[layer_name]
 +                            )
-                 key = (full_cls_name, layer_kv_cache_spec)
-                 attn_backends[key] = AttentionGroupKey(
-                     attn_backend, layer_kv_cache_spec
+                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
+                 # expose ``num_heads``; fall back to 0 so they cluster as
+                 # before. Such layers never coexist with Attention in a
