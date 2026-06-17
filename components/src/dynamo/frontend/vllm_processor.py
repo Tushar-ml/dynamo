@@ -36,7 +36,7 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fetch_model
 
-from dynamo.common.metrics_relay import get_metrics_relay_client
+from dynamo.common.metrics_relay import get_metrics_relay_client, resolve_deployment
 
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .utils import (
@@ -711,10 +711,16 @@ class VllmProcessor:
             yield make_internal_error(request_id, str(e))
         finally:
             metrics_client = get_metrics_relay_client()
+            logger.info(
+                "metrics relay: finally reached request_id=%s t_first=%s metrics_client=%s",
+                request_id,
+                t_first,
+                metrics_client,
+            )
             if metrics_client is not None and t_first is not None:
                 t_end = time.monotonic()
                 streaming = bool(request.get("stream", False))
-                deployment = request.get("model", "unknown")
+                deployment = resolve_deployment(request.get("model"))
                 ttft_sec = (t_first - t_start) if streaming else (t_end - t_start)
                 total_sec = max(t_end - t_start, 1e-9)
                 input_tokens = len(tokens)
