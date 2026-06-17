@@ -305,6 +305,7 @@ async fn anthropic_messages(
     let request = context.map(|_req| chat_request);
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.set_streaming(streaming);
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(

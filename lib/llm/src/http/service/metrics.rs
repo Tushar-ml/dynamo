@@ -391,6 +391,7 @@ pub struct ResponseMetricCollector {
     metrics: Arc<Metrics>,
     model: String,
     start_time: Instant,
+    streaming: bool,
     // we use is_first_token to distinguish TTFT from ITL. It is true by default and
     // flipped to false when the first token is returned and TTFT is published.
     is_first_token: bool,
@@ -1297,9 +1298,10 @@ impl ResponseMetricCollector {
         ResponseMetricCollector {
             metrics,
             model,
+            start_time: Instant::now(),
+            streaming: false,
             is_first_token: true,
             last_response_time: None,
-            start_time: Instant::now(),
             osl: 0,
             isl: 0,
             ttft_ms: None,
@@ -1358,6 +1360,11 @@ impl ResponseMetricCollector {
     /// Check if this will be the first token (before calling observe_response)
     pub fn is_first_token(&self) -> bool {
         self.is_first_token
+    }
+
+    /// Mark this request as streaming so relay metrics use TTFT-based denominators.
+    pub fn set_streaming(&mut self, streaming: bool) {
+        self.streaming = streaming;
     }
 
     /// Observe cached tokens (prefix cache hits), observing only once per request when value is available
@@ -1540,6 +1547,15 @@ impl Drop for ResponseMetricCollector {
         if let Some(worker_id) = self.decode_worker_id {
             span.record("decode_worker_id", worker_id);
         }
+
+        super::relay_metrics::emit(
+            &self.model,
+            self.streaming,
+            self.ttft_ms,
+            self.isl,
+            self.osl,
+            self.start_time.elapsed().as_secs_f64(),
+        );
     }
 }
 

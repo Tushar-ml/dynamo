@@ -56,7 +56,7 @@ class MetricsRelayClient:
         import aiohttp
 
         url = f"{self._relay_addr}{path}"
-        logger.debug("metrics relay: posting to %s payload=%s", url, payload)
+        logger.info("metrics relay: posting to %s payload=%s", url, payload)
 
         for attempt in range(_MAX_RETRIES + 1):
             if attempt > 0:
@@ -86,10 +86,10 @@ class MetricsRelayClient:
                                 payload,
                             )
                         else:
-                            logger.debug(
-                                "metrics relay: success %d for %s",
+                            logger.info(
+                                "metrics relay: posted %s → HTTP %d",
+                                payload.get("metric_type"),
                                 resp.status,
-                                path,
                             )
                         return
                     # 5xx server error — fall through to retry

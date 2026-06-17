@@ -731,6 +731,17 @@ class VllmProcessor:
                 )
                 input_denom = max(ttft_sec, 1e-9) if streaming else total_sec
                 output_denom = max(t_end - t_first, 1e-9) if streaming else total_sec
+                logger.info(
+                    "metrics relay: emitting deployment=%s streaming=%s ttft_ms=%d "
+                    "input_tokens=%d output_tokens=%d total_output_tokens=%d last_usage=%s",
+                    deployment,
+                    streaming,
+                    int(ttft_sec * 1000),
+                    input_tokens,
+                    output_tokens,
+                    total_output_tokens,
+                    last_usage,
+                )
                 metrics_client.capture_generic_metric(
                     "ttft", deployment, int(ttft_sec * 1000), streaming
                 )
