@@ -22,6 +22,8 @@ from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fetch_model
 from dynamo.llm.exceptions import InvalidArgument, Unknown
 
+from dynamo.common.metrics_relay import get_metrics_relay_client
+
 from .sglang_prepost import (
     SglangStreamingPostProcessor,
     ToolCallParserType,
@@ -466,6 +468,10 @@ class SglangProcessor:
         post_proc_total_ms = 0.0
         created_ts = int(time.time())
         stream_interval = self.stream_interval
+        t_start = time.monotonic()
+        t_first: float | None = None
+        total_output_tokens = 0
+        last_usage: dict[str, Any] | None = None
 
         try:
             dynamo_stream = await self.routed_engine.generate(
@@ -506,12 +512,14 @@ class SglangProcessor:
                     break
 
                 new_ids = engine_response["token_ids"]
+                total_output_tokens += len(new_ids)
                 raw_finish = engine_response.get("finish_reason")
                 finish_reason = _map_finish_reason(raw_finish)
                 stop_reason = engine_response.get("stop_reason")
 
                 if usage := engine_response.get("completion_usage"):
                     pending_usage = usage
+                    last_usage = usage
 
                 pending_token_ids.extend(new_ids)
 
@@ -549,6 +557,8 @@ class SglangProcessor:
                         ):
                             dynamo_out["nvext"] = {"stop_reason": stop_reason}
 
+                        if t_first is None:
+                            t_first = time.monotonic()
                         yield dynamo_out
 
                     pending_token_ids = []
@@ -562,6 +572,46 @@ class SglangProcessor:
                 f"Error generating response for request {request_id}: {e}"
             ) from e
         finally:
+            metrics_client = get_metrics_relay_client()
+            if metrics_client is not None and t_first is not None:
+                t_end = time.monotonic()
+                streaming = bool(request.get("stream", False))
+                deployment = request.get("model", "unknown")
+                ttft_sec = (t_first - t_start) if streaming else (t_end - t_start)
+                total_sec = max(t_end - t_start, 1e-9)
+                input_tokens = len(tokens)
+                output_tokens = (
+                    last_usage.get("completion_tokens", total_output_tokens)
+                    if last_usage
+                    else total_output_tokens
+                )
+                input_denom = max(ttft_sec, 1e-9) if streaming else total_sec
+                output_denom = max(t_end - t_first, 1e-9) if streaming else total_sec
+                metrics_client.capture_generic_metric(
+                    "ttft", deployment, int(ttft_sec * 1000), streaming
+                )
+                if input_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "input_throughput",
+                        deployment,
+                        int(input_tokens / input_denom),
+                        streaming,
+                    )
+                if output_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "output_throughput",
+                        deployment,
+                        int(output_tokens / output_denom),
+                        streaming,
+                    )
+                total_tokens = input_tokens + output_tokens
+                if total_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "total_throughput",
+                        deployment,
+                        int(total_tokens / total_sec),
+                        streaming,
+                    )
             if self.debug_perf and token_count > 0:
                 logger.info(
                     "[perf] sglang stream done: request=%s tokens=%d "
