@@ -577,7 +577,7 @@ class SglangProcessor:
                 t_end = time.monotonic()
                 streaming = bool(request.get("stream", False))
                 deployment = request.get("model", "unknown")
-                ttft_sec = t_first - t_start
+                ttft_sec = (t_first - t_start) if streaming else (t_end - t_start)
                 total_sec = max(t_end - t_start, 1e-9)
                 input_tokens = len(tokens)
                 output_tokens = (
