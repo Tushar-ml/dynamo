@@ -31,11 +31,13 @@ class MetricsRelayClient:
         self._relay_addr = relay_addr.rstrip("/")
         # Lazily created and reused; recreated if closed.
         self._session: Optional[object] = None  # aiohttp.ClientSession
+        logger.info("MetricsRelayClient created: relay_addr=%s", self._relay_addr)
 
     def _get_session(self) -> object:
         import aiohttp
 
         if self._session is None or self._session.closed:  # type: ignore[union-attr]
+            logger.debug("metrics relay: creating new aiohttp.ClientSession")
             self._session = aiohttp.ClientSession()
         return self._session
 
@@ -43,10 +45,19 @@ class MetricsRelayClient:
         import aiohttp
 
         url = f"{self._relay_addr}{path}"
+        logger.debug("metrics relay: posting to %s payload=%s", url, payload)
 
         for attempt in range(_MAX_RETRIES + 1):
             if attempt > 0:
-                await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+                delay = _RETRY_DELAYS[attempt - 1]
+                logger.debug(
+                    "metrics relay: retry %d/%d in %.1fs for %s",
+                    attempt,
+                    _MAX_RETRIES,
+                    delay,
+                    path,
+                )
+                await asyncio.sleep(delay)
 
             try:
                 session = self._get_session()
@@ -56,30 +67,37 @@ class MetricsRelayClient:
                     timeout=aiohttp.ClientTimeout(total=2.0),
                 ) as resp:
                     if resp.status < 500:
-                        # 2xx/3xx = success; 4xx = client error (don't retry)
                         if resp.status >= 400:
+                            logger.warning(
+                                "metrics relay client error %d for %s (payload=%s)",
+                                resp.status,
+                                path,
+                                payload,
+                            )
+                        else:
                             logger.debug(
-                                "metrics relay client error %d for %s",
+                                "metrics relay: success %d for %s",
                                 resp.status,
                                 path,
                             )
                         return
                     # 5xx server error — fall through to retry
-                    logger.debug(
-                        "metrics relay server error %d (attempt %d/%d)",
+                    logger.warning(
+                        "metrics relay server error %d (attempt %d/%d) for %s",
                         resp.status,
                         attempt + 1,
                         _MAX_RETRIES + 1,
+                        path,
                     )
             except Exception as exc:
-                logger.debug(
+                logger.warning(
                     "metrics relay post failed (attempt %d/%d): %s",
                     attempt + 1,
                     _MAX_RETRIES + 1,
                     exc,
                 )
 
-        logger.debug("metrics relay gave up after %d attempts for %s", _MAX_RETRIES + 1, path)
+        logger.warning("metrics relay gave up after %d attempts for %s", _MAX_RETRIES + 1, path)
 
     def capture_generic_metric(
         self,
@@ -96,12 +114,19 @@ class MetricsRelayClient:
             "value": value,
             "metadata": {"streaming": streaming},
         }
+        logger.debug(
+            "metrics relay: scheduling metric metric_type=%s deployment=%s value=%d streaming=%s",
+            metric_type,
+            deployment,
+            value,
+            streaming,
+        )
         try:
             asyncio.get_running_loop().create_task(
                 self._post_with_retry("/custom-metric", payload)
             )
         except RuntimeError:
-            pass
+            logger.warning("metrics relay: no running event loop, metric dropped: %s", payload)
 
 
 def get_metrics_relay_client() -> Optional[MetricsRelayClient]:
@@ -111,6 +136,9 @@ def get_metrics_relay_client() -> Optional[MetricsRelayClient]:
         return _client
     addr = os.environ.get(_RELAY_ADDR_ENV)
     if not addr:
+        logger.debug(
+            "metrics relay disabled: %s env var not set", _RELAY_ADDR_ENV
+        )
         return None
     _client = MetricsRelayClient(addr)
     return _client
