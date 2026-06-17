@@ -1549,7 +1549,6 @@ impl Drop for ResponseMetricCollector {
         }
 
         super::relay_metrics::emit(
-            &self.model,
             self.streaming,
             self.ttft_ms,
             self.isl,

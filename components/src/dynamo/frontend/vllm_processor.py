@@ -711,12 +711,6 @@ class VllmProcessor:
             yield make_internal_error(request_id, str(e))
         finally:
             metrics_client = get_metrics_relay_client()
-            logger.info(
-                "metrics relay: finally reached request_id=%s t_first=%s metrics_client=%s",
-                request_id,
-                t_first,
-                metrics_client,
-            )
             if metrics_client is not None and t_first is not None:
                 t_end = time.monotonic()
                 streaming = bool(request.get("stream", False))
@@ -731,17 +725,6 @@ class VllmProcessor:
                 )
                 input_denom = max(ttft_sec, 1e-9) if streaming else total_sec
                 output_denom = max(t_end - t_first, 1e-9) if streaming else total_sec
-                logger.info(
-                    "metrics relay: emitting deployment=%s streaming=%s ttft_ms=%d "
-                    "input_tokens=%d output_tokens=%d total_output_tokens=%d last_usage=%s",
-                    deployment,
-                    streaming,
-                    int(ttft_sec * 1000),
-                    input_tokens,
-                    output_tokens,
-                    total_output_tokens,
-                    last_usage,
-                )
                 metrics_client.capture_generic_metric(
                     "ttft", deployment, int(ttft_sec * 1000), streaming
                 )

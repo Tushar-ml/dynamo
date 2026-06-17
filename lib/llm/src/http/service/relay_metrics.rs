@@ -18,7 +18,6 @@ static RELAY: OnceLock<Option<RelayState>> = OnceLock::new();
 struct RelayState {
     client: reqwest::Client,
     url: String,
-    deployment_slug: Option<String>,
     namespace: Option<String>,
 }
 
@@ -54,17 +53,6 @@ fn get_relay() -> Option<&'static RelayState> {
                 }
             };
 
-            tracing::info!(
-                addr = %addr,
-                skip_tls_verify = skip_tls,
-                "metrics relay: client initialized"
-            );
-
-            let deployment_slug = std::env::var("METRICS_DEPLOYMENT_SLUG")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-
             let namespace = std::env::var("NAMESPACE")
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -73,27 +61,16 @@ fn get_relay() -> Option<&'static RelayState> {
             Some(RelayState {
                 url: format!("{}/custom-metric", addr),
                 client,
-                deployment_slug,
                 namespace,
             })
         })
         .as_ref()
 }
 
-fn resolve_deployment<'a>(model: &'a str, relay: &'a RelayState) -> &'a str {
-    // Match go-proxy: namespace is preferred so metrics land under the same
-    // label that Grafana/Mimir dashboards query (go-proxy always overrides
-    // deployment with namespace before POSTing to /custom-metric).
-    if let Some(s) = &relay.deployment_slug {
-        return s.as_str();
-    }
-    if let Some(ns) = &relay.namespace {
-        return ns.as_str();
-    }
-    if !model.is_empty() {
-        return model;
-    }
-    "unknown"
+fn resolve_deployment(relay: &RelayState) -> &str {
+    // Always use the Kubernetes namespace so metrics land under the same label
+    // that Grafana/Mimir dashboards query (matches go-proxy behaviour).
+    relay.namespace.as_deref().unwrap_or("unknown")
 }
 
 /// Emit TTFT + throughput metrics to the relay. Fire-and-forget; never blocks the caller.
@@ -101,7 +78,6 @@ fn resolve_deployment<'a>(model: &'a str, relay: &'a RelayState) -> &'a str {
 /// `ttft_ms`: measured first-token time. For streaming, this is the true TTFT; for
 /// non-streaming callers should pass `None` and the total elapsed is used instead.
 pub fn emit(
-    model: &str,
     streaming: bool,
     ttft_ms: Option<f64>,
     isl: usize,
@@ -114,7 +90,7 @@ pub fn emit(
         return;
     }
 
-    let deployment = resolve_deployment(model, relay).to_string();
+    let deployment = resolve_deployment(relay).to_string();
     let client = relay.client.clone();
     let url = relay.url.clone();
 
@@ -148,7 +124,7 @@ pub fn emit(
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
         Err(_) => {
-            tracing::debug!("metrics relay: no tokio runtime available, metrics dropped");
+            tracing::warn!("metrics relay: no tokio runtime available, metrics dropped");
             return;
         }
     };
@@ -170,12 +146,6 @@ pub fn emit(
                         RETRY_DELAYS_MS[(attempt - 1) as usize],
                     ))
                     .await;
-                    tracing::debug!(
-                        "metrics relay: retry {}/{} for {}",
-                        attempt,
-                        MAX_RETRIES,
-                        metric_type
-                    );
                 }
                 match client.post(&url).json(&payload).send().await {
                     Ok(resp) if resp.status().is_server_error() => {
@@ -194,12 +164,6 @@ pub fn emit(
                                 resp.status(),
                                 metric_type,
                                 payload
-                            );
-                        } else {
-                            tracing::info!(
-                                "metrics relay: posted {} → HTTP {}",
-                                metric_type,
-                                resp.status(),
                             );
                         }
                         succeeded = true;

@@ -34,21 +34,12 @@ class MetricsRelayClient:
         self._verify_ssl = verify_ssl
         # Lazily created and reused; recreated if closed.
         self._session: Optional[object] = None  # aiohttp.ClientSession
-        logger.info(
-            "MetricsRelayClient created: relay_addr=%s verify_ssl=%s",
-            self._relay_addr,
-            self._verify_ssl,
-        )
 
     def _get_session(self) -> object:
         import aiohttp
 
         if self._session is None or self._session.closed:  # type: ignore[union-attr]
             connector = aiohttp.TCPConnector(ssl=False if not self._verify_ssl else None)
-            logger.debug(
-                "metrics relay: creating new aiohttp.ClientSession verify_ssl=%s",
-                self._verify_ssl,
-            )
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
@@ -56,19 +47,10 @@ class MetricsRelayClient:
         import aiohttp
 
         url = f"{self._relay_addr}{path}"
-        logger.info("metrics relay: posting to %s payload=%s", url, payload)
 
         for attempt in range(_MAX_RETRIES + 1):
             if attempt > 0:
-                delay = _RETRY_DELAYS[attempt - 1]
-                logger.debug(
-                    "metrics relay: retry %d/%d in %.1fs for %s",
-                    attempt,
-                    _MAX_RETRIES,
-                    delay,
-                    path,
-                )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
 
             try:
                 session = self._get_session()
@@ -84,12 +66,6 @@ class MetricsRelayClient:
                                 resp.status,
                                 path,
                                 payload,
-                            )
-                        else:
-                            logger.info(
-                                "metrics relay: posted %s → HTTP %d",
-                                payload.get("metric_type"),
-                                resp.status,
                             )
                         return
                     # 5xx server error — fall through to retry
@@ -125,13 +101,6 @@ class MetricsRelayClient:
             "value": value,
             "metadata": {"streaming": streaming},
         }
-        logger.debug(
-            "metrics relay: scheduling metric metric_type=%s deployment=%s value=%d streaming=%s",
-            metric_type,
-            deployment,
-            value,
-            streaming,
-        )
         try:
             asyncio.get_running_loop().create_task(
                 self._post_with_retry("/custom-metric", payload)
@@ -143,23 +112,10 @@ class MetricsRelayClient:
 def resolve_deployment(request_model: Optional[str]) -> str:
     """Return the deployment label for metrics.
 
-    Priority matches go-proxy behaviour: namespace is preferred so metrics
-    land under the same label that Grafana/Mimir dashboards query.
-
-      1. METRICS_DEPLOYMENT_SLUG env var (explicit Helm/env override)
-      2. NAMESPACE env var (Kubernetes downward API) — same as go-proxy
-      3. model field from the request (last resort to avoid "unknown")
-      4. "unknown"
+    Always uses the Kubernetes namespace so metrics land under the same label
+    that Grafana/Mimir dashboards query (matches go-proxy behaviour).
     """
-    slug = os.environ.get(_DEPLOYMENT_SLUG_ENV, "").strip()
-    if slug:
-        return slug
-    ns = os.environ.get("NAMESPACE", "").strip()
-    if ns:
-        return ns
-    if request_model:
-        return request_model
-    return "unknown"
+    return os.environ.get("NAMESPACE", "unknown").strip() or "unknown"
 
 
 def get_metrics_relay_client() -> Optional[MetricsRelayClient]:
@@ -169,10 +125,6 @@ def get_metrics_relay_client() -> Optional[MetricsRelayClient]:
         return _client
     addr = os.environ.get(_RELAY_ADDR_ENV)
     if not addr:
-        logger.info(
-            "metrics relay disabled: %s env var not set, no metrics will be emitted",
-            _RELAY_ADDR_ENV,
-        )
         return None
     verify_ssl = os.environ.get(_RELAY_SKIP_TLS_ENV, "").strip() not in ("1", "true", "yes")
     _client = MetricsRelayClient(addr, verify_ssl=verify_ssl)
