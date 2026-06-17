@@ -81,14 +81,17 @@ fn get_relay() -> Option<&'static RelayState> {
 }
 
 fn resolve_deployment<'a>(model: &'a str, relay: &'a RelayState) -> &'a str {
-    if !model.is_empty() {
-        return model;
-    }
+    // Match go-proxy: namespace is preferred so metrics land under the same
+    // label that Grafana/Mimir dashboards query (go-proxy always overrides
+    // deployment with namespace before POSTing to /custom-metric).
     if let Some(s) = &relay.deployment_slug {
         return s.as_str();
     }
     if let Some(ns) = &relay.namespace {
         return ns.as_str();
+    }
+    if !model.is_empty() {
+        return model;
     }
     "unknown"
 }

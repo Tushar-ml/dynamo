@@ -143,20 +143,22 @@ class MetricsRelayClient:
 def resolve_deployment(request_model: Optional[str]) -> str:
     """Return the deployment label for metrics.
 
-    Priority:
-      1. model field from the request (set by the caller)
-      2. METRICS_DEPLOYMENT_SLUG env var (explicit Helm/env override)
-      3. NAMESPACE env var (Kubernetes downward API)
-      4. "unknown" as last resort
+    Priority matches go-proxy behaviour: namespace is preferred so metrics
+    land under the same label that Grafana/Mimir dashboards query.
+
+      1. METRICS_DEPLOYMENT_SLUG env var (explicit Helm/env override)
+      2. NAMESPACE env var (Kubernetes downward API) — same as go-proxy
+      3. model field from the request (last resort to avoid "unknown")
+      4. "unknown"
     """
-    if request_model:
-        return request_model
     slug = os.environ.get(_DEPLOYMENT_SLUG_ENV, "").strip()
     if slug:
         return slug
     ns = os.environ.get("NAMESPACE", "").strip()
     if ns:
         return ns
+    if request_model:
+        return request_model
     return "unknown"
 
 
