@@ -196,6 +196,32 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             }
         }
 
+        // 1b) `tools` offered with a non-forced tool_choice (auto/none/unset) fall
+        // through here with no schema from step 1. If `response_format` is also
+        // set, constraining decoding to its schema makes it structurally
+        // impossible for the model to ever emit the tool-call parser's native
+        // syntax, since guided decoding only builds a grammar for one schema.
+        // Leave decoding unconstrained instead so a real tool call can still be
+        // emitted and picked up by the tool-call jail (which already runs for
+        // auto tool_choice whenever a parser is configured, independent of
+        // guided decoding — see `should_apply_tool_jail`).
+        {
+            use dynamo_protocols::types::ChatCompletionToolChoiceOption;
+            let tools_with_non_forced_choice = self
+                .inner
+                .tools
+                .as_deref()
+                .is_some_and(|tools| !tools.is_empty())
+                && !matches!(
+                    self.inner.tool_choice,
+                    Some(ChatCompletionToolChoiceOption::Required)
+                        | Some(ChatCompletionToolChoiceOption::Named(_))
+                );
+            if tools_with_non_forced_choice && self.inner.response_format.is_some() {
+                return None;
+            }
+        }
+
         // 2) OpenAI `response_format` (applies to assistant content, not tool calls)
         if let Some(response_format) = self.inner.response_format.as_ref() {
             use dynamo_protocols::types::ResponseFormat;
