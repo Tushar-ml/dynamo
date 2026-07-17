@@ -173,6 +173,7 @@ async fn parse_response_stream(
                 Some(tool_parser),
                 None, // No tool_choice in this test
                 None, // No tool_definitions in this test
+                false,
                 stream,
             ))
         } else {

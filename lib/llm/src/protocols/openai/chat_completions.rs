@@ -198,15 +198,21 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
 
         // 1b) `tools` offered with a non-forced tool_choice (auto/none/unset) fall
         // through here with no schema from step 1. If `response_format` is also
-        // set, constraining decoding to its schema makes it structurally
-        // impossible for the model to ever emit the tool-call parser's native
-        // syntax, since guided decoding only builds a grammar for one schema.
-        // Leave decoding unconstrained instead so a real tool call can still be
-        // emitted and picked up by the tool-call jail (which already runs for
-        // auto tool_choice whenever a parser is configured, independent of
-        // guided decoding — see `should_apply_tool_jail`).
+        // set, guided decoding must commit to a single grammar before
+        // generation starts — but the tool-vs-content decision is the model's
+        // to make at runtime. Rather than picking one and structurally
+        // foreclosing the other (the old behavior: response_format schema wins,
+        // tool calls become impossible), union the two schemas with `anyOf` so
+        // decoding stays hard-constrained to *one of* two valid shapes: the
+        // response_format schema, or a tool-call array matching
+        // `tools::build_required_schema` (the same shape used for
+        // `tool_choice=required`). The jail (forced into Immediate/ArrayOfTools
+        // mode for this combo in `preprocessor::apply_tool_calling_jail`)
+        // discriminates the two shapes after generation: an array parses as
+        // real tool_calls, anything else (the response_format object) falls
+        // through unchanged as content — see RCA task4 for the full writeup.
         {
-            use dynamo_protocols::types::ChatCompletionToolChoiceOption;
+            use dynamo_protocols::types::{ChatCompletionToolChoiceOption, ResponseFormat};
             let tools_with_non_forced_choice = self
                 .inner
                 .tools
@@ -217,8 +223,34 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
                     Some(ChatCompletionToolChoiceOption::Required)
                         | Some(ChatCompletionToolChoiceOption::Named(_))
                 );
-            if tools_with_non_forced_choice && self.inner.response_format.is_some() {
-                return None;
+            if tools_with_non_forced_choice
+                && let Some(response_format) = self.inner.response_format.as_ref()
+            {
+                let response_schema = match response_format {
+                    ResponseFormat::Text => None,
+                    ResponseFormat::JsonObject => Some(serde_json::json!({"type": "object"})),
+                    ResponseFormat::JsonSchema { json_schema } => json_schema.schema.clone(),
+                };
+                if let Some(response_schema) = response_schema {
+                    // Safety: tools_with_non_forced_choice already confirmed
+                    // `tools` is Some and non-empty.
+                    let tools_slice = self.inner.tools.as_deref().unwrap();
+                    match tools::build_required_schema(tools_slice) {
+                        Ok(tool_call_schema) => {
+                            return Some(serde_json::json!({
+                                "anyOf": [response_schema, tool_call_schema]
+                            }));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to build tool-call schema for response_format union; \
+                                 falling back to unconstrained decoding"
+                            );
+                            return None;
+                        }
+                    }
+                }
             }
         }
 
