@@ -3300,7 +3300,6 @@ fahrenheit
             Some("qwen3_coder".to_string()),
             Some(ChatCompletionToolChoiceOption::Required),
             None,
-            false,
             input_stream,
         )
         .collect()
@@ -3388,7 +3387,6 @@ fahrenheit
                 "get_weather".to_string().into(),
             )),
             None,
-            false,
             input_stream,
         )
         .collect()
@@ -3481,7 +3479,6 @@ fahrenheit
             Some("minimax_m2".to_string()),
             Some(ChatCompletionToolChoiceOption::Required),
             None,
-            false,
             stream::iter(input_chunks),
         )
         .collect()
@@ -3556,7 +3553,6 @@ fahrenheit
             Some("hermes".to_string()),
             Some(ChatCompletionToolChoiceOption::Required),
             None,
-            false,
             stream::iter(input_chunks),
         )
         .collect()
@@ -3610,7 +3606,6 @@ fahrenheit
                 "get_weather".to_string().into(),
             )),
             None,
-            false,
             stream::iter(input_chunks),
         )
         .collect()
@@ -3669,7 +3664,6 @@ fahrenheit
                 "get_weather".to_string().into(),
             )),
             None,
-            false,
             stream::iter(input_chunks),
         )
         .collect()
@@ -3715,7 +3709,6 @@ fahrenheit
                 "get_weather".to_string().into(),
             )),
             None,
-            false,
             stream::iter(input_chunks),
         )
         .collect()
@@ -3758,17 +3751,18 @@ fahrenheit
     }
 
     /// Regression test for task4 (SquadStack): `tools` + non-forced tool_choice
-    /// + `response_format` together must not foreclose real tool calls.
-    /// Guided decoding is unioned (`anyOf`) between the response_format schema
-    /// and a tool-call array (see chat_completions::get_guided_json), so the
-    /// jail must run in Immediate/ArrayOfTools mode here — this covers the
-    /// branch where the model actually emits the tool-call array shape.
+    /// + `response_format`. The combo is now hard-constrained by an xgrammar
+    /// structural tag (chat_completions::get_structural_tag) whose tool branch is
+    /// Gemma-4's *native* syntax, so the jail stays in the ordinary MarkerBased
+    /// mode and parses that syntax exactly as it does for plain `tool_choice=auto`.
+    /// This confirms auto + a configured parser still yields real tool calls (no
+    /// Immediate/ArrayOfTools special-casing left over from the anyOf attempt).
     #[tokio::test]
-    async fn test_response_format_union_tool_branch_parses_as_tool_call() {
-        let tool_call_json = r#"[{"name":"get_weather","parameters":{"city":"Bengaluru"}}]"#;
+    async fn test_auto_tool_choice_parses_native_gemma4_tool_call() {
+        let native = r#"<|tool_call>call:get_weather{city:<|"|>Bengaluru<|"|>}<tool_call|>"#;
 
         let input_chunks = vec![test_utils::create_mock_response_chunk(
-            tool_call_json.to_string(),
+            native.to_string(),
             0,
         )];
 
@@ -3776,7 +3770,6 @@ fahrenheit
             Some("gemma4".to_string()),
             None, // tool_choice=auto/unset
             None,
-            true, // response_format_union_active
             stream::iter(input_chunks),
         )
         .collect()
@@ -3799,7 +3792,7 @@ fahrenheit
 
         assert_eq!(
             tool_call_count, 1,
-            "tool-call-array branch of the response_format union should parse as a real tool call"
+            "native gemma4 tool call under tool_choice=auto should parse as a real tool call"
         );
 
         for r in &results {
@@ -3816,63 +3809,5 @@ fahrenheit
                 }
             }
         }
-    }
-
-    /// Companion to the test above: the response_format-schema branch of the
-    /// union must still pass through as ordinary content (no tool_calls), so
-    /// non-tool turns keep producing the client's requested JSON shape.
-    #[tokio::test]
-    async fn test_response_format_union_content_branch_passes_through() {
-        use dynamo_protocols::types::ChatCompletionMessageContent;
-
-        let schema_json = r#"{"assistant_reply":"Hello!","memory":null,"next_stage":null}"#;
-
-        let input_chunks = vec![test_utils::create_mock_response_chunk(
-            schema_json.to_string(),
-            0,
-        )];
-
-        let results: Vec<_> = OpenAIPreprocessor::apply_tool_calling_jail(
-            Some("gemma4".to_string()),
-            None, // tool_choice=auto/unset
-            None,
-            true, // response_format_union_active
-            stream::iter(input_chunks),
-        )
-        .collect()
-        .await;
-
-        let tool_call_count: usize = results
-            .iter()
-            .map(|r| {
-                r.data.as_ref().map_or(0, |d| {
-                    d.inner
-                        .choices
-                        .iter()
-                        .map(|c: &ChatChoiceStream| {
-                            c.delta.tool_calls.as_ref().map_or(0, |tc| tc.len())
-                        })
-                        .sum::<usize>()
-                })
-            })
-            .sum();
-        assert_eq!(
-            tool_call_count, 0,
-            "response_format-schema branch must not be misparsed as a tool call"
-        );
-
-        let emitted_text: String = results
-            .iter()
-            .flat_map(|r| r.data.as_ref().map(|d| &d.inner.choices).into_iter())
-            .flatten()
-            .filter_map(|c| match c.delta.content.as_ref()? {
-                ChatCompletionMessageContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            emitted_text.contains("assistant_reply"),
-            "response_format JSON must pass through as content unchanged: {emitted_text:?}"
-        );
     }
 }

@@ -113,7 +113,7 @@ fn clone_parameters(function: &FunctionObject) -> Value {
 /// We extract `$defs` from each tool's schema and merge them into a global `$defs` map
 /// at the root level. If multiple tools define the same type, we verify they match to
 /// avoid conflicts.
-pub(crate) fn build_required_schema(tools: &[ChatCompletionTool]) -> Result<Value, ToolChoiceError> {
+fn build_required_schema(tools: &[ChatCompletionTool]) -> Result<Value, ToolChoiceError> {
     // Accumulator for all shared type definitions ($defs) across tools
     let mut defs: BTreeMap<String, Value> = BTreeMap::new();
     let mut any_of = Vec::with_capacity(tools.len());

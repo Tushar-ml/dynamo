@@ -561,7 +561,6 @@ mod tests {
             Some("nemotron_deci".to_string()),
             None, // No tool_choice in this test
             None, // No tool_definitions in this test
-            false,
             reasoning_parsed_stream,
         );
 
@@ -677,7 +676,6 @@ mod tests {
             Some("kimi_k2".to_string()),
             None,
             None,
-            false,
             reasoning_parsed_stream,
         );
 
@@ -778,7 +776,6 @@ mod tests {
             Some("harmony".to_string()),
             None, // No tool_choice in this test
             None, // No tool_definitions in this test
-            false,
             reasoning_parsed_stream,
         );
 

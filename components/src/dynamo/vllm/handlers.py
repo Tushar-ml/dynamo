@@ -3,6 +3,7 @@
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 
@@ -342,12 +343,19 @@ def build_sampling_params(
     sampling_options = request.get("sampling_options", {})
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
+        # vLLM wants the structural tag as a JSON string, not a dict (mirrors the
+        # sglang backend). The Rust frontend sends it as a JSON object, so serialize
+        # it here; leave it untouched if some caller already passed a string.
+        structural_tag = guided_decoding.get("structural_tag")
+        if structural_tag is not None and not isinstance(structural_tag, str):
+            structural_tag = json.dumps(structural_tag)
         sampling_params.structured_outputs = StructuredOutputsParams(
             json=guided_decoding.get("json"),
             regex=guided_decoding.get("regex"),
             choice=guided_decoding.get("choice"),
             grammar=guided_decoding.get("grammar"),
             whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+            structural_tag=structural_tag,
         )
 
     # Apply remaining sampling_options

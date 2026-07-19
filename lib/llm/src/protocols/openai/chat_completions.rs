@@ -166,6 +166,98 @@ impl OpenAISamplingOptionsProvider for NvCreateChatCompletionRequest {
     }
 }
 
+/// Gemma-4 native tool-call argument grammar (GBNF/EBNF), transcribed from the
+/// recursive-descent parser in `lib/parsers/src/tool_calling/gemma4/parser.rs`
+/// (informal grammar at parser.rs:488-499). It constrains the bytes *between* the
+/// `<|tool_call>call:NAME{` and `}<tool_call|>` markers: bare keys, `<|"|>`-delimited
+/// strings, numbers, booleans, null/none/nil, and nested objects/arrays. It does not
+/// enforce any individual tool's `parameters` schema (a JSON-Schema→EBNF transpiler
+/// would be needed for that) — argument correctness is model-driven, exactly as in the
+/// plain tool-calling path. The `string` rule forbids the `<|"|>` delimiter from
+/// appearing in a body by disallowing `<` immediately followed by `|`.
+const GEMMA4_ARGS_GRAMMAR: &str = r#"root    ::= (entry ("," entry)*)?
+entry   ::= key ":" value
+key     ::= [a-zA-Z0-9_.\-]+
+value   ::= string | number | bool | null | object | array
+string  ::= "<|\"|>" char* "<|\"|>"
+char    ::= [^<] | "<" [^|]
+number  ::= "-"? [0-9]+ ("." [0-9]+)?
+bool    ::= "true" | "false"
+null    ::= "null" | "none" | "nil"
+object  ::= "{" (entry ("," entry)*)? "}"
+array   ::= "[" (value ("," value)*)? "]""#;
+
+/// Builds the xgrammar structural tag described on `get_structural_tag`: a top-level
+/// `OrFormat` whose two alternatives are the `response_format` schema (as a
+/// `json_schema` element) and a `tags_with_separator` of one native-tool-call tag per
+/// declared tool. With no `any_text` element anywhere, the schema branch stays a hard
+/// guarantee. Shape verified to compile and match correctly against xgrammar 0.2.0.
+fn build_gemma4_structural_tag(
+    response_schema: &serde_json::Value,
+    tools: &[dynamo_protocols::types::ChatCompletionTool],
+) -> serde_json::Value {
+    let tags: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "tag",
+                "begin": format!("<|tool_call>call:{}{{", tool.function.name),
+                "content": {"type": "grammar", "grammar": GEMMA4_ARGS_GRAMMAR},
+                "end": "}<tool_call|>",
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "type": "structural_tag",
+        "format": {
+            "type": "or",
+            "elements": [
+                {"type": "json_schema", "json_schema": response_schema},
+                {
+                    "type": "tags_with_separator",
+                    "separator": "",
+                    "at_least_one": true,
+                    "tags": tags,
+                },
+            ],
+        },
+    })
+}
+
+impl NvCreateChatCompletionRequest {
+    /// Returns the `response_format` schema to enforce *iff* this request is the
+    /// structural-tag combo: non-empty `tools`, a non-forced `tool_choice`
+    /// (auto/none/unset — not required/named), and a JSON `response_format`. `None`
+    /// otherwise. Drives both `get_guided_json` (returns `None` to yield to the tag)
+    /// and `get_structural_tag` (builds the tag), so the two can never both fire.
+    fn structural_tag_response_schema(&self) -> Option<serde_json::Value> {
+        use dynamo_protocols::types::{ChatCompletionToolChoiceOption, ResponseFormat};
+
+        let has_tools = self
+            .inner
+            .tools
+            .as_deref()
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return None;
+        }
+        if matches!(
+            self.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+                | Some(ChatCompletionToolChoiceOption::Named(_))
+        ) {
+            return None;
+        }
+
+        match self.inner.response_format.as_ref()? {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(serde_json::json!({"type": "object"})),
+            ResponseFormat::JsonSchema { json_schema } => json_schema.schema.clone(),
+        }
+    }
+}
+
 /// Implements `CommonExtProvider` for `NvCreateChatCompletionRequest`,
 /// providing access to common extension fields.
 impl CommonExtProvider for NvCreateChatCompletionRequest {
@@ -196,62 +288,16 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             }
         }
 
-        // 1b) `tools` offered with a non-forced tool_choice (auto/none/unset) fall
-        // through here with no schema from step 1. If `response_format` is also
-        // set, guided decoding must commit to a single grammar before
-        // generation starts — but the tool-vs-content decision is the model's
-        // to make at runtime. Rather than picking one and structurally
-        // foreclosing the other (the old behavior: response_format schema wins,
-        // tool calls become impossible), union the two schemas with `anyOf` so
-        // decoding stays hard-constrained to *one of* two valid shapes: the
-        // response_format schema, or a tool-call array matching
-        // `tools::build_required_schema` (the same shape used for
-        // `tool_choice=required`). The jail (forced into Immediate/ArrayOfTools
-        // mode for this combo in `preprocessor::apply_tool_calling_jail`)
-        // discriminates the two shapes after generation: an array parses as
-        // real tool_calls, anything else (the response_format object) falls
-        // through unchanged as content — see RCA task4 for the full writeup.
-        {
-            use dynamo_protocols::types::{ChatCompletionToolChoiceOption, ResponseFormat};
-            let tools_with_non_forced_choice = self
-                .inner
-                .tools
-                .as_deref()
-                .is_some_and(|tools| !tools.is_empty())
-                && !matches!(
-                    self.inner.tool_choice,
-                    Some(ChatCompletionToolChoiceOption::Required)
-                        | Some(ChatCompletionToolChoiceOption::Named(_))
-                );
-            if tools_with_non_forced_choice
-                && let Some(response_format) = self.inner.response_format.as_ref()
-            {
-                let response_schema = match response_format {
-                    ResponseFormat::Text => None,
-                    ResponseFormat::JsonObject => Some(serde_json::json!({"type": "object"})),
-                    ResponseFormat::JsonSchema { json_schema } => json_schema.schema.clone(),
-                };
-                if let Some(response_schema) = response_schema {
-                    // Safety: tools_with_non_forced_choice already confirmed
-                    // `tools` is Some and non-empty.
-                    let tools_slice = self.inner.tools.as_deref().unwrap();
-                    match tools::build_required_schema(tools_slice) {
-                        Ok(tool_call_schema) => {
-                            return Some(serde_json::json!({
-                                "anyOf": [response_schema, tool_call_schema]
-                            }));
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to build tool-call schema for response_format union; \
-                                 falling back to unconstrained decoding"
-                            );
-                            return None;
-                        }
-                    }
-                }
-            }
+        // 1b) `tools` offered with a non-forced tool_choice (auto/none/unset) plus a
+        // `response_format` schema is handled by a structural tag (see
+        // `get_structural_tag`), not by `guided_json`. That tag hard-constrains
+        // decoding to *either* a native Gemma-4 tool call *or* schema-valid content,
+        // keeping both guarantees. Return `None` here so `guided_json` stays unset —
+        // it is mutually exclusive with `structural_tag`
+        // (`common::GuidedDecodingOptions::validate`), and the response schema below
+        // (step 2) would otherwise re-foreclose tool calls (the original bug).
+        if self.structural_tag_response_schema().is_some() {
+            return None;
         }
 
         // 2) OpenAI `response_format` (applies to assistant content, not tool calls)
@@ -287,6 +333,18 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
 
     fn get_guided_choice(&self) -> Option<Vec<String>> {
         self.common.guided_choice.clone()
+    }
+
+    /// Builds an xgrammar structural tag for the `tools` + non-forced `tool_choice`
+    /// + `response_format` combo, so decoding is hard-constrained to *either* a
+    /// native Gemma-4 tool call *or* schema-valid content — never free text, and
+    /// never one foreclosing the other. Returns `None` for every other request, in
+    /// which case the ordinary `guided_json`/`guided_grammar` path applies.
+    fn get_structural_tag(&self) -> Option<serde_json::Value> {
+        let response_schema = self.structural_tag_response_schema()?;
+        // `structural_tag_response_schema` already guaranteed non-empty tools.
+        let tools = self.inner.tools.as_deref()?;
+        Some(build_gemma4_structural_tag(&response_schema, tools))
     }
 
     fn get_guided_decoding_backend(&self) -> Option<String> {
@@ -571,5 +629,101 @@ mod tests {
             serde_json::from_value(unsupported_stop_token_ids)
                 .expect("Failed to deserialize request");
         assert!(ValidateRequest::validate(&request).is_err());
+    }
+
+    // --- structural tag for tools + response_format (task4 / SquadStack) ---
+
+    fn weather_tool() -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        })
+    }
+
+    fn response_format_schema() -> serde_json::Value {
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "reply",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                },
+            },
+        })
+    }
+
+    fn request_from(value: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(value).expect("Failed to deserialize request")
+    }
+
+    #[test]
+    fn structural_tag_built_for_tools_plus_response_format() {
+        let req = request_from(json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": "weather in Bengaluru?"}],
+            "tools": [weather_tool()],
+            "response_format": response_format_schema(),
+        }));
+
+        // The combo yields a structural tag, and NOT a guided_json (mutually
+        // exclusive — see common::GuidedDecodingOptions::validate).
+        assert!(req.get_guided_json().is_none());
+        let tag = req.get_structural_tag().expect("structural tag expected");
+        assert_eq!(tag["type"], "structural_tag");
+        assert_eq!(tag["format"]["type"], "or");
+        let elements = tag["format"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0]["type"], "json_schema");
+        assert_eq!(elements[1]["type"], "tags_with_separator");
+        assert_eq!(elements[1]["at_least_one"], true);
+        let first_tag = &elements[1]["tags"][0];
+        assert_eq!(first_tag["begin"], "<|tool_call>call:get_weather{");
+        assert_eq!(first_tag["end"], "}<tool_call|>");
+        assert_eq!(first_tag["content"]["type"], "grammar");
+    }
+
+    #[test]
+    fn no_structural_tag_without_response_format() {
+        let req = request_from(json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [weather_tool()],
+        }));
+        assert!(req.get_structural_tag().is_none());
+    }
+
+    #[test]
+    fn no_structural_tag_without_tools() {
+        let req = request_from(json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": response_format_schema(),
+        }));
+        assert!(req.get_structural_tag().is_none());
+        // Plain response_format still drives guided_json as before.
+        assert!(req.get_guided_json().is_some());
+    }
+
+    #[test]
+    fn no_structural_tag_for_required_tool_choice() {
+        let req = request_from(json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [weather_tool()],
+            "tool_choice": "required",
+            "response_format": response_format_schema(),
+        }));
+        // Forced tool_choice keeps its own tool-schema guided_json; no structural tag.
+        assert!(req.get_structural_tag().is_none());
+        assert!(req.get_guided_json().is_some());
     }
 }

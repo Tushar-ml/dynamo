@@ -23,7 +23,7 @@ use anyhow::{Result, bail};
 use dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionRequestMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionToolChoiceOption, EncodingFormat, ResponseFormat,
+    ChatCompletionToolChoiceOption, EncodingFormat,
 };
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use futures::Stream;
@@ -1601,27 +1601,6 @@ impl OpenAIPreprocessor {
             has_tools,
         )?;
 
-        // `tools` + non-forced tool_choice + `response_format` together mean
-        // guided decoding constrained the model to an `anyOf` union of the
-        // response schema and a tool-call array (see
-        // chat_completions::get_guided_json). The native marker-based jail
-        // can't recognize that array shape — it looks for the model's raw
-        // token syntax (e.g. gemma4's `call:fn{...}`), not JSON brackets — so
-        // this combo needs the Immediate/ArrayOfTools jail mode instead (the
-        // same one tool_choice=required uses), which parses via
-        // try_tool_call_parse_basic_json and already falls back to plain-text
-        // content when the accumulated JSON doesn't match the array shape.
-        let response_format_union_active = has_tools
-            && !matches!(
-                request.inner.tool_choice,
-                Some(ChatCompletionToolChoiceOption::Required)
-                    | Some(ChatCompletionToolChoiceOption::Named(_))
-            )
-            && matches!(
-                request.inner.response_format,
-                Some(ResponseFormat::JsonSchema { .. }) | Some(ResponseFormat::JsonObject)
-            );
-
         let should_sanitize_gemma4_leaked_channels = reasoning_disabled_by_request
             && !should_jail
             && (Self::is_gemma4_parser(self.runtime_config.tool_call_parser.as_deref())
@@ -1661,7 +1640,6 @@ impl OpenAIPreprocessor {
                 self.tool_call_parser.clone(),
                 request.inner.tool_choice.clone(),
                 tool_definitions,
-                response_format_union_active,
                 stream,
             ))
         } else {
@@ -2014,7 +1992,6 @@ impl OpenAIPreprocessor {
         tool_call_parser: Option<String>,
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
         tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
-        response_format_union_active: bool,
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
@@ -2059,22 +2036,11 @@ impl OpenAIPreprocessor {
             Some(ChatCompletionToolChoiceOption::Auto)
             | Some(ChatCompletionToolChoiceOption::None)
             | None => {
-                if response_format_union_active {
-                    // Guided decoding constrained output to an anyOf union of
-                    // the response_format schema and a tool-call array (see
-                    // chat_completions::get_guided_json). The model's native
-                    // token syntax was never a valid grammar branch, so the
-                    // marker-based jail has nothing to match — use the same
-                    // Immediate/ArrayOfTools parsing as tool_choice=required.
-                    // Its base_json_parser only recognizes the
-                    // `{name, parameters}`/`{name, arguments}` shape, so a
-                    // response_format-shaped object falls through all its
-                    // parse attempts and is emitted as plain content —
-                    // exactly the non-tool-call branch of the union.
-                    builder = builder.tool_choice_required();
-                }
-                // Traditional marker-based jail for auto/none/unspecified
-                // (unaffected when response_format_union_active is false).
+                // Traditional marker-based jail for auto/none/unspecified. When a
+                // `response_format` is also present, the structural tag built in
+                // chat_completions::get_structural_tag constrains the model to emit
+                // the parser's own native tool-call syntax, so MarkerBased parsing
+                // is exactly right here — no special-casing needed.
                 if let Some(parser) = tool_call_parser {
                     builder = builder.tool_call_parser(parser);
                 }

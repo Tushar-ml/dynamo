@@ -160,7 +160,6 @@ async fn parse_response_stream(
         tool_parser,
         None,
         tool_definitions,
-        false,
         stream,
     ));
 

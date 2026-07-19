@@ -103,6 +103,14 @@ pub trait CommonExtProvider {
     #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
 
+    /// xgrammar structural tag. Mutually exclusive with the other guided-decoding
+    /// options above. Defaults to `None`; only the chat-completions provider builds
+    /// one, to hard-constrain `tools` + `response_format` requests to *either* a
+    /// native tool call *or* schema-valid content (see `get_structural_tag` there).
+    fn get_structural_tag(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Other sampling Options
     fn get_top_k(&self) -> Option<i32>;
     fn get_min_p(&self) -> Option<f32>;
