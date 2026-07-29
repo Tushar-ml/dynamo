@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import urllib.request
+import urllib.parse
+import tempfile
 import argparse
 import ipaddress
 import json
@@ -159,6 +162,38 @@ def _warn_frontend_only_worker_flags(
         )
 
 
+
+def _resolve_custom_jinja_template(location: str) -> str:
+    """Return a local path for the template, fetching it first if given a URL.
+
+    A template held in the image can be shadowed by a volume mounted over its directory
+    (Kubernetes deployments mount the model download PVC at /workspace), so being able to
+    pass an http(s) URL avoids depending on the image layout at all. Mirrors
+    --prefix-warmup-file, which already accepts either.
+    """
+    if urllib.parse.urlparse(location).scheme in ("http", "https"):
+        try:
+            with urllib.request.urlopen(location, timeout=30) as resp:
+                body = resp.read()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to fetch custom Jinja template from {location}: {exc}"
+            ) from exc
+        handle, path = tempfile.mkstemp(prefix="custom_jinja_", suffix=".jinja")
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(body)
+        logger.info("Fetched custom Jinja template from %s to %s", location, path)
+        return path
+
+    expanded = os.path.expanduser(os.path.expandvars(location))
+    if not os.path.isfile(expanded):
+        raise FileNotFoundError(
+            f"Custom Jinja template file not found: {expanded}. "
+            "Please ensure the file exists and the path is correct, or pass an "
+            "http(s) URL."
+        )
+    return expanded
+
 def _has_prefix_warmup_config(dynamo_config: Config) -> bool:
     if dynamo_config.prefix_warmup_file:
         return True
@@ -226,15 +261,9 @@ def update_dynamo_config_with_engine(
         dynamo_config.endpoint = parsed_ep
 
     if dynamo_config.custom_jinja_template is not None:
-        expanded_template_path = os.path.expanduser(
-            os.path.expandvars(dynamo_config.custom_jinja_template)
+        dynamo_config.custom_jinja_template = _resolve_custom_jinja_template(
+            dynamo_config.custom_jinja_template
         )
-        dynamo_config.custom_jinja_template = expanded_template_path
-        if not os.path.isfile(expanded_template_path):
-            raise FileNotFoundError(
-                f"Custom Jinja template file not found: {expanded_template_path}. "
-                "Please ensure the file exists and the path is correct."
-            )
 
     # --connector is no longer supported for vLLM. Raise hard error if explicitly set.
     _reject_connector_flag(dynamo_config)
