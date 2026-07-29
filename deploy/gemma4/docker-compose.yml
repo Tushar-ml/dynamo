@@ -1,0 +1,101 @@
+# Gemma 4 on Dynamo + vLLM: etcd, NATS, one worker, one frontend.
+#
+#   MODEL_DIR=/path/to/gemma-4-31B-it docker compose up -d
+#   curl localhost:8000/v1/models
+#
+# MODEL_DIR must be a plain directory holding the model files. A HuggingFace cache
+# snapshot path is rejected by discovery ("Model snapshots for ... not found in cache"),
+# so either point at a real directory or mount the whole `models--org--name` directory
+# and use `/model/snapshots/<revision>` so its relative symlinks still resolve.
+#
+# DRAFT_DIR is optional and enables speculative decoding with the MTP draft model
+# (google/gemma-4-31B-it-assistant). Leave it unset to run without.
+
+x-model-mounts: &model-mounts
+  - ${MODEL_DIR:?set MODEL_DIR to the model directory}:/model:ro
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=default=http://etcd:2380
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-p", "4222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8222/healthz || exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    image: ${DYNAMO_IMAGE:-simplismart/simplismart-inference-server-base:higgs-vllm-gemma4}
+    depends_on:
+      etcd: {condition: service_healthy}
+      nats: {condition: service_started}
+    # The image's default user is uid 1000; mounted model directories are usually owned
+    # by another uid, and the worker then fails with "Permission denied". Run as root
+    # unless the mount is readable by uid 1000.
+    user: "0:0"
+    ipc: host
+    shm_size: 16gb
+    environment:
+      ETCD_ENDPOINTS: http://etcd:2379
+      NATS_SERVER: nats://nats:4222
+      HF_HUB_OFFLINE: "1"
+    volumes: *model-mounts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-2}
+              capabilities: [gpu]
+    entrypoint: ["python3", "-m", "dynamo.vllm"]
+    command:
+      - --model=/model
+      - --served-model-name=${SERVED_MODEL_NAME:-gemma4}
+      - --dyn-tool-call-parser=gemma4
+      - --dyn-reasoning-parser=gemma4
+      # Tool-use gating: without it the model calls a tool on turns that should just
+      # speak. See ../../container/chat_templates/README.md.
+      - --custom-jinja-template=/workspace/chat_templates/gemma4_tool_gated.jinja
+      - --tensor-parallel-size=${TP:-2}
+      - --max-model-len=${MAX_MODEL_LEN:-64000}
+      - --max-num-seqs=${MAX_NUM_SEQS:-8}
+      - --gpu-memory-utilization=${GPU_MEM_UTIL:-0.90}
+
+  frontend:
+    image: ${DYNAMO_IMAGE:-simplismart/simplismart-inference-server-base:higgs-vllm-gemma4}
+    depends_on:
+      etcd: {condition: service_healthy}
+      nats: {condition: service_started}
+    user: "0:0"
+    ports:
+      - "${HTTP_PORT:-8000}:${HTTP_PORT:-8000}"
+    environment:
+      ETCD_ENDPOINTS: http://etcd:2379
+      NATS_SERVER: nats://nats:4222
+      HF_HUB_OFFLINE: "1"
+    # The frontend renders the chat template, so it needs the model directory too.
+    volumes: *model-mounts
+    entrypoint: ["python3", "-m", "dynamo.frontend"]
+    command:
+      - --http-port=${HTTP_PORT:-8000}
+
+volumes:
+  etcd-data:

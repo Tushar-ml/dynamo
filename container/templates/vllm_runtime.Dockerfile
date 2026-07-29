@@ -33,7 +33,9 @@ WORKDIR /workspace
 
 ENV DYNAMO_HOME=/opt/dynamo
 {% if context.vllm.vllm_ref %}
-ENV VLLM_USE_PRECOMPILED={{ context.vllm.vllm_use_precompiled }}
+# Take the value from the ARG so `--build-arg VLLM_USE_PRECOMPILED=0` works; baking the
+# rendered default into an ENV silently overrode it.
+ENV VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED}
 ENV VLLM_MAIN_CUDA_VERSION={{ context.vllm.vllm_cuda_version }}
 ENV LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH:-}
 {% endif %}

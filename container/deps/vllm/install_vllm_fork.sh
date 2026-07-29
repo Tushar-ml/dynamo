@@ -125,12 +125,45 @@ fi
 # Some forks import setuptools_rust in setup.py without listing it in build deps.
 uv pip install "${PIP_TARGET[@]}" setuptools_rust
 
-# Python-only install: download precompiled .so from wheels.vllm.ai (no CMake build).
-uv pip install "${PIP_TARGET[@]}" \
-  --no-build-isolation \
-  --no-deps \
-  --force-reinstall \
-  --constraints "${PROTECTED_CONSTRAINTS}" \
-  /tmp/vllm-fork-src
+# CUDA dev headers/libs needed for a source build. The runtime image ships the CUDA
+# runtime only, so cmake fails with "cusparse.h: No such file or directory" or
+# "CUDA_nvrtc_LIBRARY (ADVANCED) ... NOTFOUND".
+install_cuda_build_deps() {
+  local ver="${VLLM_CUDA_VERSION:-12.9}"
+  local pkg_ver="${ver//./-}"
+  echo "Installing CUDA dev packages for a vLLM source build (cuda ${ver})"
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    "cuda-libraries-dev-${pkg_ver}" "cuda-nvrtc-dev-${pkg_ver}" || \
+    echo "WARNING: CUDA dev packages unavailable; the source build may fail" >&2
+  rm -rf /var/lib/apt/lists/*
+  if [ ! -e /usr/local/cuda/lib64/libnvrtc.so ] && [ -e /usr/local/cuda/lib64/libnvrtc.so.12 ]; then
+    ln -sf /usr/local/cuda/lib64/libnvrtc.so.12 /usr/local/cuda/lib64/libnvrtc.so
+  fi
+}
+
+install_vllm_fork_pkg() {
+  uv pip install "${PIP_TARGET[@]}" \
+    --no-build-isolation \
+    --no-deps \
+    --force-reinstall \
+    --constraints "${PROTECTED_CONSTRAINTS}" \
+    /tmp/vllm-fork-src
+}
+
+# Precompiled first (python-only install: fetch the .so, no CMake build). Wheels are not
+# published for every architecture at every commit -- the pinned nightly commit has an
+# aarch64 wheel and no x86_64 one, so an x86_64 build fails with "No precompiled vllm
+# wheel found for architecture". Fall back to a source build rather than failing.
+if ! install_vllm_fork_pkg; then
+  if [ "${VLLM_USE_PRECOMPILED}" = "1" ]; then
+    echo "Precompiled install failed on $(uname -m); falling back to a source build"
+    export VLLM_USE_PRECOMPILED=0
+    install_cuda_build_deps
+    install_vllm_fork_pkg
+  else
+    exit 1
+  fi
+fi
 
 python3 -c "import torch, vllm; print('torch:', torch.__version__, 'cuda:', torch.version.cuda); print('vLLM fork:', vllm.__version__, 'from', vllm.__file__)"
