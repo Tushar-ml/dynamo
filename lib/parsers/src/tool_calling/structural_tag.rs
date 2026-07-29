@@ -30,6 +30,10 @@ pub const GEMMA4_TOOL_CALL_TRIGGER: &str = "<|tool_call>";
 pub const GEMMA4_REASONING_END: &str = "<channel|>";
 
 /// Tool-call branch: one tag per tool, at least one call, body unconstrained.
+///
+/// `tags_with_separator` admits nothing but tool calls, so a forced choice cannot be
+/// satisfied by prose. `triggered_tags` is equivalent here (both reject free text) but
+/// reads as "text until a trigger", which is not the intent.
 fn gemma4_tool_calls(tool_names: &[String]) -> Value {
     let tags: Vec<Value> = tool_names
         .iter()
@@ -44,9 +48,9 @@ fn gemma4_tool_calls(tool_names: &[String]) -> Value {
         .collect();
 
     json!({
-        "type": "triggered_tags",
-        "triggers": [GEMMA4_TOOL_CALL_TRIGGER],
+        "type": "tags_with_separator",
         "tags": tags,
+        "separator": "",
         "at_least_one": true,
         "stop_after_first": false,
     })
@@ -72,6 +76,13 @@ pub fn gemma4_structural_tag(
 
     let tool_calls = gemma4_tool_calls(tool_names);
 
+    // A forced tool choice must not offer a content branch. The schema object is a legal
+    // *prefix* of "content then tool call", so the model writes it and then ends the turn
+    // with a special token — which the grammar cannot mask — leaving the demanded call
+    // unmade. OpenAI semantics agree: response_format constrains content, and a forced
+    // choice produces a tool call rather than content.
+    let content_schema = if tools_mandatory { None } else { content_schema };
+
     let body = match content_schema {
         Some(schema) => {
             let content = json!({
@@ -79,11 +90,7 @@ pub fn gemma4_structural_tag(
                 "json_schema": schema,
                 "style": "json",
             });
-            let after_content = if tools_mandatory {
-                tool_calls.clone()
-            } else {
-                json!({"type": "optional", "content": tool_calls.clone()})
-            };
+            let after_content = json!({"type": "optional", "content": tool_calls.clone()});
             json!({
                 "type": "or",
                 "elements": [
@@ -169,23 +176,24 @@ mod tests {
         assert_eq!(tag["format"]["type"], "or");
         // branch 0: content then optional tool calls; branch 1: tool calls alone
         assert_eq!(tag["format"]["elements"][0]["elements"][1]["type"], "optional");
-        assert_eq!(tag["format"]["elements"][1]["type"], "triggered_tags");
+        assert_eq!(tag["format"]["elements"][1]["type"], "tags_with_separator");
     }
 
     #[test]
-    fn forced_choice_makes_tool_calls_mandatory() {
+    fn forced_choice_drops_the_content_branch() {
+        // The schema object is a legal prefix of "content then tool call", so offering it
+        // lets the model write content and end the turn with a special token the grammar
+        // cannot mask, leaving the demanded call unmade. Forced choice therefore admits
+        // tool calls only — which is also what response_format means in OpenAI's API.
         let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false).unwrap();
-        // the branch that starts with content must end in a mandatory tool call
-        assert_eq!(
-            tag["format"]["elements"][0]["elements"][1]["type"],
-            "triggered_tags"
-        );
+        assert_eq!(tag["format"]["type"], "tags_with_separator");
+        assert_eq!(tag["format"]["at_least_one"], true);
     }
 
     #[test]
     fn without_schema_the_native_tag_is_used_alone() {
         let tag = gemma4_structural_tag(&names(), None, true, false).unwrap();
-        assert_eq!(tag["format"]["type"], "triggered_tags");
+        assert_eq!(tag["format"]["type"], "tags_with_separator");
     }
 
     #[test]

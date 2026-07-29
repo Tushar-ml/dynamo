@@ -2122,10 +2122,18 @@ impl OpenAIPreprocessor {
             return;
         }
 
-        // A json_schema response_format is the content constraint worth keeping.
-        let content_schema = to_json(request.response_format())
-            .and_then(|rf| rf.get("json_schema").cloned())
-            .and_then(|js| js.get("schema").cloned());
+        // The content constraint worth keeping: an explicit json_schema, or json_object,
+        // which is "any JSON object" and would otherwise fall back to a bare JSON grammar
+        // and swallow the tool call exactly as a schema does.
+        let content_schema = to_json(request.response_format()).and_then(|rf| {
+            match rf.get("type").and_then(|t| t.as_str()) {
+                Some("json_schema") => rf
+                    .get("json_schema")
+                    .and_then(|js| js.get("schema").cloned()),
+                Some("json_object") => Some(serde_json::json!({"type": "object"})),
+                _ => None,
+            }
+        });
 
         // Nothing to fix for a plain auto request with no content constraint:
         // no grammar is applied today and none is needed.
