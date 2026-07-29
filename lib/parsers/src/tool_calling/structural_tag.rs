@@ -28,6 +28,7 @@ pub const GEMMA4_TOOL_CALL_BEGIN: &str = "<|tool_call>call:";
 pub const GEMMA4_TOOL_CALL_END: &str = "<tool_call|>";
 pub const GEMMA4_TOOL_CALL_TRIGGER: &str = "<|tool_call>";
 pub const GEMMA4_REASONING_END: &str = "<channel|>";
+pub const GEMMA4_THOUGHT_BEGIN: &str = "<|channel>thought\n";
 
 /// Tool-call branch: one tag per tool, at least one call, body unconstrained.
 ///
@@ -109,19 +110,41 @@ pub fn gemma4_structural_tag(
         return Some(json!({"type": "structural_tag", "format": body}));
     }
 
-    // Two ways generation can begin inside the thought channel, and the tag
-    // cannot see the prompt: the model may open the block itself, or the chat
-    // template may have left the prompt inside an already-open block so that
-    // only the closer is emitted (the post-tool-response continuation).
-    let reasoning_prefix = json!({
-        "type": "optional",
-        "content": {
-            "type": "tag",
-            "begin": "",
-            "content": {"type": "any_text", "excludes": []},
-            "end": GEMMA4_REASONING_END,
-        },
-    });
+    // The tag cannot see the prompt, so generation may begin inside the thought
+    // channel two ways: the model opens the block itself, or the chat template
+    // left the prompt inside an already-open block and only the closer is emitted
+    // (the post-tool-response continuation).
+    //
+    // An unconstrained opener ("begin": "") covers both, but it accepts arbitrary
+    // text up to the closer — and because special tokens escape the grammar mask,
+    // the model can emit that text and then simply end its turn. Under a forced
+    // tool choice that is a hole big enough to skip the demanded call: measured on
+    // gemma-4-31B-it, the model wrote the schema object and stopped. So a forced
+    // choice constrains the opener, which leaves `<|tool_call>call:` as the only
+    // other legal start. The trade-off is that a forced turn cannot resume an
+    // already-open thought channel; the continuation case arrives with an
+    // unforced choice.
+    let reasoning_prefix = if tools_mandatory {
+        json!({
+            "type": "optional",
+            "content": {
+                "type": "tag",
+                "begin": GEMMA4_THOUGHT_BEGIN,
+                "content": {"type": "any_text", "excludes": []},
+                "end": GEMMA4_REASONING_END,
+            },
+        })
+    } else {
+        json!({
+            "type": "optional",
+            "content": {
+                "type": "tag",
+                "begin": "",
+                "content": {"type": "any_text", "excludes": []},
+                "end": GEMMA4_REASONING_END,
+            },
+        })
+    };
 
     Some(json!({
         "type": "structural_tag",
@@ -214,6 +237,20 @@ mod tests {
         assert_eq!(tags[0]["begin"], "<|tool_call>call:fetch_seller_details");
         assert_eq!(tags[0]["content"]["type"], "any_text");
         assert_eq!(tags[0]["end"], GEMMA4_TOOL_CALL_END);
+    }
+
+    #[test]
+    fn forced_choice_constrains_the_reasoning_opener() {
+        // An unconstrained opener accepts arbitrary text before the closer, which lets the
+        // model emit content and end its turn instead of making the demanded call.
+        let forced = gemma4_structural_tag(&names(), None, true, true).unwrap();
+        assert_eq!(
+            forced["format"]["elements"][0]["content"]["begin"],
+            GEMMA4_THOUGHT_BEGIN
+        );
+        // An unforced turn keeps both openings, so a prompt-opened channel still works.
+        let auto = gemma4_structural_tag(&names(), None, false, true).unwrap();
+        assert_eq!(auto["format"]["elements"][0]["content"]["begin"], "");
     }
 
     #[test]
