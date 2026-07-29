@@ -501,7 +501,10 @@ impl OpenAIPreprocessor {
         }
 
         builder.stop_conditions(stop_conditions);
-        builder.sampling_options(request.extract_sampling_options()?);
+
+        let mut sampling_options = request.extract_sampling_options()?;
+        self.apply_native_tool_call_constraint(request, &mut sampling_options);
+        builder.sampling_options(sampling_options);
 
         // Some parsers rely on `<|tool_call>`, `<|channel>`, etc. being
         // visible in the decoded text. The default `skip_special_tokens=true`
@@ -2053,6 +2056,127 @@ impl OpenAIPreprocessor {
     /// hooks. Used to flip the request default for `skip_special_tokens`
     /// from `true` to `false` so the parsers actually see the markers
     /// they're matching on.
+    /// Constrain tool calls with the model's native structural tag instead of a
+    /// JSON grammar, when the configured tool-call parser has one.
+    ///
+    /// Two request shapes are broken without this:
+    ///
+    /// * `response_format` + `tools` with `tool_choice: "auto"` — the schema is
+    ///   the only grammar, and it accepts nothing but the schema object. A model
+    ///   that opens a native tool call is coerced into the JSON string and never
+    ///   terminates: the request burns its whole token budget and the client gets
+    ///   a malformed object and no tool call. Emit a union tag that accepts the
+    ///   schema, tool calls, or both.
+    /// * a forced (`required` / named) `tool_choice` — `get_guided_json` derives a
+    ///   generic OpenAI-style JSON tool-call schema, which Gemma 4 does not speak
+    ///   (it emits `<|tool_call>call:name{...}<tool_call|>`), so the model is
+    ///   pushed into a shape its own parser cannot read. Emit the native tag.
+    ///
+    /// Leaves the request untouched for parsers without a native tag, when there
+    /// are no tools, and for `tool_choice: "none"` (offering a tool branch there
+    /// would let the model call a tool the caller excluded).
+    fn apply_native_tool_call_constraint<R: OAIChatLikeRequest>(
+        &self,
+        request: &R,
+        sampling_options: &mut crate::protocols::common::SamplingOptions,
+    ) {
+        use dynamo_parsers::tool_calling::structural_tag;
+
+        let parser = self.tool_call_parser.as_deref();
+        if !structural_tag::parser_has_structural_tag(parser) {
+            return;
+        }
+
+        // These accessors hand back template values; go through serde to get JSON.
+        let to_json = |value: Option<minijinja::Value>| -> Option<serde_json::Value> {
+            value.and_then(|v| serde_json::to_value(v).ok())
+        };
+
+        let Some(tools) = to_json(request.tools()) else {
+            return;
+        };
+        let tool_names = Self::tool_names_from_value(&tools);
+        if tool_names.is_empty() {
+            return;
+        }
+
+        // `tool_choice` arrives as JSON: "auto" | "none" | "required" | {"function": {"name": ...}}
+        let tool_choice = to_json(request.tool_choice());
+        let choice_str = tool_choice.as_ref().and_then(|v| v.as_str());
+        if choice_str == Some("none") {
+            return;
+        }
+        let named_tool = tool_choice
+            .as_ref()
+            .and_then(|v| v.get("function"))
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
+        let tools_mandatory = choice_str == Some("required") || named_tool.is_some();
+
+        let selected: Vec<String> = match &named_tool {
+            Some(name) => tool_names.iter().filter(|n| *n == name).cloned().collect(),
+            None => tool_names,
+        };
+        if selected.is_empty() {
+            return;
+        }
+
+        // A json_schema response_format is the content constraint worth keeping.
+        let content_schema = to_json(request.response_format())
+            .and_then(|rf| rf.get("json_schema").cloned())
+            .and_then(|js| js.get("schema").cloned());
+
+        // Nothing to fix for a plain auto request with no content constraint:
+        // no grammar is applied today and none is needed.
+        if content_schema.is_none() && !tools_mandatory {
+            return;
+        }
+
+        let Some(tag) = structural_tag::structural_tag_for_parser(
+            parser,
+            &selected,
+            content_schema.as_ref(),
+            tools_mandatory,
+            true,
+        ) else {
+            return;
+        };
+
+        let guided = sampling_options
+            .guided_decoding
+            .get_or_insert_with(Default::default);
+        // Exactly one constraint may be set; the tag supersedes the JSON schema.
+        guided.json = None;
+        guided.structural_tag = Some(tag);
+
+        tracing::debug!(
+            parser = ?parser,
+            tools = ?selected,
+            tools_mandatory,
+            "applied native tool-call structural tag"
+        );
+    }
+
+    /// Tool names from the request's `tools` array, in either OpenAI shape.
+    fn tool_names_from_value(tools: &serde_json::Value) -> Vec<String> {
+        tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.get("function")
+                            .and_then(|f| f.get("name"))
+                            .or_else(|| tool.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn parser_requires_special_tokens(
         tool_call_parser: Option<&str>,
         reasoning_parser: Option<&str>,

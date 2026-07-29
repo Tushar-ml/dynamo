@@ -11,6 +11,7 @@ pub mod json;
 pub mod parsers;
 pub mod pythonic;
 pub mod response;
+pub mod structural_tag;
 #[cfg(test)]
 pub mod tests;
 pub mod tools;
@@ -28,6 +29,9 @@ pub use config::{
     JsonParserConfig, KimiK2ParserConfig, ParserConfig, ToolCallConfig, XmlParserConfig,
 };
 pub use dsml::try_tool_call_parse_dsml;
+pub use structural_tag::{
+    gemma4_structural_tag, parser_has_structural_tag, structural_tag_for_parser,
+};
 pub use gemma4::{
     diff_reasoning_streaming_snapshots, extract_reasoning_non_streaming,
     extract_tool_handoff_text, strip_trailing_incomplete_token, try_tool_call_parse_gemma4,
