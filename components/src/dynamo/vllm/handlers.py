@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import asyncio
 import inspect
 import logging
@@ -342,12 +343,19 @@ def build_sampling_params(
     sampling_options = request.get("sampling_options", {})
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
+        # The frontend sends a structural tag for models whose tool-call syntax is
+        # not JSON (Gemma 4). Dropping it here leaves every constraint unset and
+        # StructuredOutputsParams rejects the request.
+        structural_tag = guided_decoding.get("structural_tag")
+        if structural_tag is not None and not isinstance(structural_tag, str):
+            structural_tag = json.dumps(structural_tag)
         sampling_params.structured_outputs = StructuredOutputsParams(
             json=guided_decoding.get("json"),
             regex=guided_decoding.get("regex"),
             choice=guided_decoding.get("choice"),
             grammar=guided_decoding.get("grammar"),
             whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+            structural_tag=structural_tag,
         )
 
     # Apply remaining sampling_options
