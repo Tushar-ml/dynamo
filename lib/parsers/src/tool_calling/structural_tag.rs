@@ -35,7 +35,7 @@ pub const GEMMA4_THOUGHT_BEGIN: &str = "<|channel>thought\n";
 /// `tags_with_separator` admits nothing but tool calls, so a forced choice cannot be
 /// satisfied by prose. `triggered_tags` is equivalent here (both reject free text) but
 /// reads as "text until a trigger", which is not the intent.
-fn gemma4_tool_calls(tool_names: &[String]) -> Value {
+fn gemma4_tool_calls(tool_names: &[String], stop_after_first: bool) -> Value {
     let tags: Vec<Value> = tool_names
         .iter()
         .map(|name| {
@@ -53,7 +53,7 @@ fn gemma4_tool_calls(tool_names: &[String]) -> Value {
         "tags": tags,
         "separator": "",
         "at_least_one": true,
-        "stop_after_first": false,
+        "stop_after_first": stop_after_first,
     })
 }
 
@@ -75,7 +75,11 @@ pub fn gemma4_structural_tag(
         return None;
     }
 
-    let tool_calls = gemma4_tool_calls(tool_names);
+    // A forced choice must stop after one call. With repetition allowed the grammar keeps
+    // offering another tag and nothing pushes the model to stop: measured on
+    // gemma-4-31B-it, `required` emitted the same call 28 times until max_tokens. An
+    // unforced turn keeps repetition available, since a model may legitimately batch calls.
+    let tool_calls = gemma4_tool_calls(tool_names, tools_mandatory);
 
     // A forced tool choice must not offer a content branch. The schema object is a legal
     // *prefix* of "content then tool call", so the model writes it and then ends the turn
@@ -251,6 +255,15 @@ mod tests {
         // An unforced turn keeps both openings, so a prompt-opened channel still works.
         let auto = gemma4_structural_tag(&names(), None, false, true).unwrap();
         assert_eq!(auto["format"]["elements"][0]["content"]["begin"], "");
+    }
+
+    #[test]
+    fn forced_choice_stops_after_one_call() {
+        let forced = gemma4_structural_tag(&names(), None, true, false).unwrap();
+        assert_eq!(forced["format"]["stop_after_first"], true);
+        // an unforced turn keeps repetition: the tool-only branch of the union
+        let auto = gemma4_structural_tag(&names(), Some(&schema()), false, false).unwrap();
+        assert_eq!(auto["format"]["elements"][1]["stop_after_first"], false);
     }
 
     #[test]
