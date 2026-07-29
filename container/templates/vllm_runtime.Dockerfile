@@ -230,7 +230,9 @@ COPY --chmod=775 --chown=dynamo:0 dev /workspace/dev
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/common /workspace/components/src/dynamo/common
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/frontend /workspace/components/src/dynamo/frontend
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/vllm /workspace/components/src/dynamo/vllm
-COPY --chmod=775 --chown=dynamo:0 container/chat_templates /workspace/chat_templates
+# Not under /workspace: deployments mount a volume there (model download PVC), which
+# would shadow anything the image ships at that path.
+COPY --chmod=775 --chown=dynamo:0 container/chat_templates /opt/dynamo/chat_templates
 COPY --chown=dynamo:0 lib /workspace/lib
 
 # Setup launch banner in common directory accessible to all users

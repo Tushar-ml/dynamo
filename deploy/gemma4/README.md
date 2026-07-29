@@ -24,7 +24,7 @@ docker run -d --name gemma4-worker --gpus all --network host --ipc host --shm-si
   --entrypoint python3 <image> -m dynamo.vllm \
     --model /model --served-model-name gemma4 \
     --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4 \
-    --custom-jinja-template /workspace/chat_templates/gemma4_tool_gated.jinja \
+    --custom-jinja-template /opt/dynamo/chat_templates/gemma4_tool_gated.jinja \
     --tensor-parallel-size 2 --max-model-len 64000 --max-num-seqs 8 \
     --gpu-memory-utilization 0.95
 
@@ -76,7 +76,7 @@ Two notes on using this well:
 
 - **Speech-only turns.** With the tool channel reachable, the model may call a tool on a
   turn that should just speak. `--custom-jinja-template
-  /workspace/chat_templates/gemma4_tool_gated.jinja` fixes that for all traffic by stating
+  /opt/dynamo/chat_templates/gemma4_tool_gated.jinja` fixes that for all traffic by stating
   that not calling a tool is the normal outcome. For turns where a tool call is
   *definitionally* wrong, send `tool_choice: "none"`: that is enforced by the grammar
   rather than by persuasion, and it is the only hard guarantee.

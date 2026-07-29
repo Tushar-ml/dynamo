@@ -73,7 +73,7 @@ services:
       - --dyn-reasoning-parser=gemma4
       # Tool-use gating: without it the model calls a tool on turns that should just
       # speak. See ../../container/chat_templates/README.md.
-      - --custom-jinja-template=/workspace/chat_templates/gemma4_tool_gated.jinja
+      - --custom-jinja-template=/opt/dynamo/chat_templates/gemma4_tool_gated.jinja
       - --tensor-parallel-size=${TP:-2}
       - --max-model-len=${MAX_MODEL_LEN:-64000}
       - --max-num-seqs=${MAX_NUM_SEQS:-8}

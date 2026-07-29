@@ -27,7 +27,7 @@ streamed, 3 runs of a 3-scenario acceptance script:
 ```bash
 python3 -m dynamo.vllm --model <gemma-4> \
     --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4 \
-    --custom-jinja-template /workspace/chat_templates/gemma4_tool_gated.jinja
+    --custom-jinja-template /opt/dynamo/chat_templates/gemma4_tool_gated.jinja
 ```
 
 ### Scope
