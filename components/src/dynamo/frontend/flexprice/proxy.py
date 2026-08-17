@@ -32,6 +32,13 @@ _BILLED_PATHS = frozenset(
     ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
 )
 
+# System endpoints that must stay reachable without a JWT — kube-probe,
+# Prometheus/Alloy scrapers, and `GET /v1/models` clients don't carry one.
+# Mirrors the Rust service's system_router (health, live, metrics, models),
+# which is unauthenticated by design; this proxy sits in front of it and must
+# not re-impose auth on the same paths.
+_UNAUTHENTICATED_PATHS = frozenset(["/health", "/live", "/metrics", "/v1/models"])
+
 # Hop-by-hop headers that must not be forwarded
 _HOP_BY_HOP = frozenset(
     [
@@ -91,19 +98,20 @@ class DynamoProxy:
     # Main handler
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
-        # ---- 1. Authentication (always required) ----------------------
-        auth_header = request.headers.get("Authorization", "")
-        try:
-            auth_ctx = authenticate(
-                auth_header,
-                self._config.auth_secret_keys,
-                self._config.auth_valid_orgs or None,
-            )
-        except AuthError as exc:
-            logger.warning("Auth failed: %s", exc)
-            return _json_error(exc.status, str(exc))
-
-        org_id = auth_ctx.org_uuid
+        # ---- 1. Authentication (skipped for system routes) -------------
+        org_id = ""
+        if request.path not in _UNAUTHENTICATED_PATHS:
+            auth_header = request.headers.get("Authorization", "")
+            try:
+                auth_ctx = authenticate(
+                    auth_header,
+                    self._config.auth_secret_keys,
+                    self._config.auth_valid_orgs or None,
+                )
+            except AuthError as exc:
+                logger.warning("Auth failed: %s", exc)
+                return _json_error(exc.status, str(exc))
+            org_id = auth_ctx.org_uuid
 
         # ---- 2. Forward to Dynamo Rust service ------------------------
         path = request.path
