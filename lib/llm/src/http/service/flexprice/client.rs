@@ -27,7 +27,7 @@ use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc};
 
 const EVENTS_PATH: &str = "/events";
-const QUEUE_SIZE: usize = 1000;
+const QUEUE_SIZE: usize = 1200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on in-flight POSTs so a burst of billed requests drains faster than
 /// one-at-a-time (which would otherwise cap throughput at 1/RTT), without

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _EVENTS_PATH = "/events"
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
-_QUEUE_SIZE = 1000
+_QUEUE_SIZE = 1200
 # Cap on in-flight POSTs so a burst of billed requests drains faster than
 # one-at-a-time (which would otherwise cap throughput at 1/RTT), without
 # spawning unbounded concurrent tasks.
