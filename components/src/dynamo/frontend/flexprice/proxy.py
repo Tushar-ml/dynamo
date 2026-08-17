@@ -1,4 +1,4 @@
-"""Dynamo auth proxy with optional async FlexPrice usage metering.
+"""Dynamo auth proxy with an optional wallet-balance gate.
 
 Request lifecycle (proxy is active whenever DYN_AUTH_ENABLED=true):
 
@@ -6,17 +6,26 @@ Request lifecycle (proxy is active whenever DYN_AUTH_ENABLED=true):
              from claims, enforce DYN_AUTH_VALID_ORGS allowlist if set.
              Return 401 on any failure.
 
-  2. Forward to the internal Dynamo Rust HTTP service.
+  2. Wallet balance gate (only when DYN_FLEXPRICE_ENABLED=true) — block
+             prepaid orgs below the minimum balance (402) before proxying at
+             all. See ``balance.py``.
 
-  3. Usage metering  (only when DYN_FLEXPRICE_ENABLED=true)
-             — extract token usage from the response (SSE stream or JSON),
-             fire-and-forget enqueue to FlexPrice (zero request latency impact).
+  3. Forward to the internal Dynamo Rust HTTP service, unchanged — including
+             the original Authorization header.
+
+Usage billing is deliberately NOT done here. The Rust service on the other
+end of step 3 receives the same Authorization header and independently runs
+its own native FlexPrice billing (lib/llm/src/http/service/flexprice/), so
+this proxy emitting its own event as well would bill every request twice.
+The Rust service is the sole biller; this proxy's job is auth + the fast-fail
+balance check in front of it.
 """
 
 import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
@@ -55,6 +64,20 @@ _HOP_BY_HOP = frozenset(
 )
 
 _JSON_CT = "application/json"
+
+# Mirrors the Rust service's header priority (see `get_or_create_request_id`
+# in openai.rs) so a request_id captured here lines up with the one the
+# backend records for the same request, whenever the client supplies one.
+_DYNAMO_REQUEST_ID_HEADER = "x-dynamo-request-id"
+_X_REQUEST_ID_HEADER = "x-request-id"
+
+
+def _get_or_create_request_id(request: web.Request) -> str:
+    return (
+        request.headers.get(_DYNAMO_REQUEST_ID_HEADER)
+        or request.headers.get(_X_REQUEST_ID_HEADER)
+        or str(uuid.uuid4())
+    )
 
 
 def _json_error(status: int, message: str) -> web.Response:
@@ -142,6 +165,7 @@ class DynamoProxy:
         path = request.path
         qs = request.query_string
         url = f"{self._backend}{path}{'?' + qs if qs else ''}"
+        request_id = _get_or_create_request_id(request)
 
         # Only capture usage when FlexPrice metering is enabled
         is_metered = self._client is not None and path in _BILLED_PATHS
@@ -190,6 +214,7 @@ class DynamoProxy:
                         resp_headers,
                         is_metered=is_metered,
                         org_id=org_id,
+                        request_id=request_id,
                         model_name=model_name,
                         start=start,
                     )
@@ -199,6 +224,7 @@ class DynamoProxy:
                         resp_headers,
                         is_metered=is_metered,
                         org_id=org_id,
+                        request_id=request_id,
                         model_name=model_name,
                         start=start,
                     )
@@ -216,6 +242,7 @@ class DynamoProxy:
         *,
         is_metered: bool,
         org_id: str,
+        request_id: str,
         model_name: str,
         start: float,
     ) -> web.StreamResponse:
@@ -245,6 +272,7 @@ class DynamoProxy:
         if is_metered and usage:
             self._emit_usage(
                 org_id=org_id,
+                request_id=request_id,
                 model_name=model_name,
                 usage=usage,
                 elapsed=time.monotonic() - start,
@@ -262,6 +290,7 @@ class DynamoProxy:
         *,
         is_metered: bool,
         org_id: str,
+        request_id: str,
         model_name: str,
         start: float,
     ) -> web.Response:
@@ -279,6 +308,7 @@ class DynamoProxy:
             if usage:
                 self._emit_usage(
                     org_id=org_id,
+                    request_id=request_id,
                     model_name=model_name,
                     usage=usage,
                     elapsed=time.monotonic() - start,
@@ -293,6 +323,7 @@ class DynamoProxy:
         self,
         *,
         org_id: str,
+        request_id: str,
         model_name: str,
         usage: Dict[str, Any],
         elapsed: float,
@@ -304,6 +335,8 @@ class DynamoProxy:
 
         properties: Dict[str, Any] = {
             "model_id": model_name,
+            "customer_id": org_id,
+            "request_id": request_id,
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
@@ -374,15 +407,20 @@ async def run_proxy(
     A FlexPriceClient (and wallet BalanceChecker) is created only when
     DYN_FLEXPRICE_ENABLED=true so that auth-only mode has zero FlexPrice
     overhead.
+
+    This proxy forwards the client's Authorization header unchanged to the
+    Dynamo Rust service, which independently re-validates it and runs its own
+    native FlexPrice billing (see lib/llm/src/http/service/flexprice/). If
+    this proxy *also* emitted a usage event for the same request, every
+    request would be billed twice — so `flexprice_client` is deliberately
+    never constructed here; the Rust service is the sole biller. The wallet
+    BalanceChecker has no such double-count risk (it's a read-only gate, not
+    an event emission), so it stays active here as a fast-fail check before
+    proxying to the backend at all.
     """
     flexprice_client: Optional[FlexPriceClient] = None
     balance_checker: Optional[BalanceChecker] = None
     if config.enabled:
-        flexprice_client = FlexPriceClient(
-            api_host=config.api_host,
-            api_key=config.api_key,
-        )
-        await flexprice_client.start()
         balance_checker = BalanceChecker(
             api_host=config.api_host,
             api_key=config.api_key,

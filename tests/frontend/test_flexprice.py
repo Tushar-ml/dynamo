@@ -644,6 +644,8 @@ class TestDynamoProxy:
                 assert len(enqueued) == 1
                 assert enqueued[0]["external_customer_id"] == _ORG_UUID
                 assert enqueued[0]["properties"]["input_tokens"] == 10
+                assert enqueued[0]["properties"]["customer_id"] == _ORG_UUID
+                assert enqueued[0]["properties"]["request_id"]
             finally:
                 await proxy_client.close()
         finally:

@@ -61,6 +61,7 @@ use crate::protocols::openai::{
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::{RequestTemplate, resolve_request_model};
 use crate::types::Annotated;
+use dynamo_protocols::types::ChatCompletionStreamOptions;
 use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
 use dynamo_protocols::types::Choice;
 use dynamo_runtime::logging::get_distributed_tracing_context;
@@ -512,7 +513,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     org_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
@@ -532,9 +533,17 @@ async fn completions_single(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        &request_id,
         &metric_model,
         streaming,
     );
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
+    }
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -684,7 +693,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -705,9 +714,19 @@ async fn completions_batch(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        &request_id,
         &metric_model,
         streaming,
     );
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    // Set once here — each per-prompt request clones `request.content()`
+    // further down, inheriting this.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
+    }
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -922,6 +941,7 @@ async fn embeddings(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        &request_id,
         &metric_model,
         streaming,
     );
@@ -1363,6 +1383,7 @@ async fn chat_completions(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        &request_id,
         &metric_model,
         streaming,
     );
@@ -1402,6 +1423,13 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
+    }
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
     }
 
     // Create HTTP queue guard after template resolution so labels are correct
@@ -1666,6 +1694,27 @@ pub fn validate_completion_stream_options(
         }));
     }
     Ok(())
+}
+
+/// Forces `include_usage` on an outgoing streaming request's `stream_options`
+/// so the engine sends token counts on the final chunk — without this, a
+/// client that didn't explicitly request `stream_options.include_usage` never
+/// gets a `usage` field on any chunk, so `UsageBillingGuard::record_usage_opt`
+/// never records anything and no billing event is ever enqueued for that
+/// stream. Only called when a billing guard is actually active (see
+/// `UsageBillingGuard::is_active`), so non-billed streaming traffic is
+/// unaffected. Preserves any `continuous_usage_stats` the client requested.
+fn force_include_usage(stream_options: &mut Option<ChatCompletionStreamOptions>) {
+    *stream_options = Some(match stream_options.take() {
+        Some(mut opts) => {
+            opts.include_usage = true;
+            opts
+        }
+        None => ChatCompletionStreamOptions {
+            include_usage: true,
+            continuous_usage_stats: false,
+        },
+    });
 }
 
 /// Validates a completion request and returns an error response if validation fails.
@@ -2831,6 +2880,27 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn force_include_usage_sets_it_when_absent() {
+        let mut stream_options = None;
+        force_include_usage(&mut stream_options);
+        let opts = stream_options.expect("stream_options must be Some");
+        assert!(opts.include_usage);
+        assert!(!opts.continuous_usage_stats);
+    }
+
+    #[test]
+    fn force_include_usage_preserves_continuous_usage_stats() {
+        let mut stream_options = Some(ChatCompletionStreamOptions {
+            include_usage: false,
+            continuous_usage_stats: true,
+        });
+        force_include_usage(&mut stream_options);
+        let opts = stream_options.expect("stream_options must be Some");
+        assert!(opts.include_usage);
+        assert!(opts.continuous_usage_stats);
+    }
 
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {
