@@ -9,19 +9,25 @@
 //! system routes (health/live/metrics/models) unauthenticated. FlexPrice
 //! usage-event billing is optional on top of auth (`DYN_FLEXPRICE_ENABLED`)
 //! and never adds latency to the request path — events are enqueued
-//! fire-and-forget and drained by a background worker.
+//! fire-and-forget and drained by a background worker. When billing is
+//! enabled, a prepaid org whose wallet balance drops below
+//! `DYN_FLEXPRICE_MINIMUM_BALANCE` (default: negative) is blocked with 402
+//! before reaching the handler; postpaid orgs always bypass this gate. See
+//! [`BalanceChecker`].
 //!
 //! This replaces the two-hop Python `aiohttp` reverse-proxy
 //! (`components/src/dynamo/frontend/flexprice/`) with native middleware and
 //! an RAII billing guard inside the Rust HTTP service itself.
 
 mod auth;
+mod balance;
 mod client;
 mod config;
 mod guard;
 mod middleware;
 
 pub use auth::AuthError;
+pub use balance::{BalanceChecker, BalanceStatus};
 pub use client::FlexPriceClient;
 pub use config::{AuthConfig, FlexPriceConfig};
 pub use guard::UsageBillingGuard;

@@ -24,6 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dynamo.frontend.flexprice.auth import AuthCtx, AuthError, authenticate
+from dynamo.frontend.flexprice.balance import BalanceChecker, BalanceStatus
 from dynamo.frontend.flexprice.client import _MAX_ATTEMPTS, FlexPriceClient
 from dynamo.frontend.flexprice.config import FlexPriceConfig
 from dynamo.frontend.flexprice.proxy import (
@@ -78,6 +79,9 @@ def _make_config(
         event_name="",
         source_name="",
         internal_port_offset=1,
+        minimum_balance=0.0,
+        deployment_name="dynamo",
+        deployment_id="local",
     )
 
 
@@ -227,6 +231,19 @@ class TestFlexPriceConfig:
         cfg.event_name = "my-event"
         assert cfg.resolve_event_name("any-model") == "my-event"
 
+    def test_resolve_source_name_default_is_deployment_based(self):
+        cfg = _make_config()
+        cfg.deployment_name = "my-deployment"
+        cfg.deployment_id = "dep-123"
+        assert cfg.resolve_source_name() == "my-deployment_dep-123"
+
+    def test_resolve_source_name_override(self):
+        cfg = _make_config()
+        cfg.source_name = "custom-source"
+        cfg.deployment_name = "my-deployment"
+        cfg.deployment_id = "dep-123"
+        assert cfg.resolve_source_name() == "custom-source"
+
 
 # client.py tests
 
@@ -340,6 +357,85 @@ class TestFlexPriceClient:
         await client.stop()
 
         assert len(attempts) == _MAX_ATTEMPTS
+
+
+class TestBalanceChecker:
+    def _fake_get(self, status: int, body: dict):
+        def fake_get(_url, **_kwargs):
+            resp = MagicMock()
+            resp.status = status
+            resp.json = AsyncMock(return_value=body)
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        return fake_get
+
+    async def test_postpaid_org_is_allowed_with_negative_balance(self):
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(
+            200, [{"balance": "-50.00", "metadata": {"isKYC": "true"}}]
+        )
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
+    async def test_prepaid_org_with_negative_balance_is_blocked(self):
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(200, [{"balance": "-1.00", "metadata": {}}])
+        assert await checker.check(_ORG_UUID) is BalanceStatus.INSUFFICIENT_BALANCE
+        await checker.stop()
+
+    async def test_prepaid_org_with_positive_balance_is_allowed(self):
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(200, [{"balance": "10.00", "metadata": {}}])
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
+    async def test_suspended_org_is_blocked_even_if_postpaid(self):
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(
+            200,
+            [
+                {
+                    "balance": "100.00",
+                    "metadata": {"isKYC": "true", "isSuspended": "true"},
+                }
+            ],
+        )
+        assert await checker.check(_ORG_UUID) is BalanceStatus.SUSPENDED
+        await checker.stop()
+
+    async def test_flexprice_api_error_fails_open(self):
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(500, [])
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
+    async def test_result_is_cached_and_not_refetched(self):
+        calls: list = []
+
+        def fake_get(_url, **_kwargs):
+            calls.append(1)
+            resp = MagicMock()
+            resp.status = 200
+            resp.json = AsyncMock(return_value=[{"balance": "10.00", "metadata": {}}])
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = fake_get
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
+        assert len(calls) == 1
 
 
 # Utility function tests
@@ -460,7 +556,7 @@ class TestDynamoProxy:
         try:
             client = await self._make_proxy_client(backend)
             try:
-                resp = await client.get("/v1/models")
+                resp = await client.get("/v1/chat/completions")
                 assert resp.status == 401
                 body = await resp.json()
                 assert body["statusCode"] == 401
@@ -475,7 +571,7 @@ class TestDynamoProxy:
             client = await self._make_proxy_client(backend)
             try:
                 resp = await client.get(
-                    "/v1/models", headers={"Authorization": "Bearer bad.token.sig"}
+                    "/v1/chat/completions", headers={"Authorization": "Bearer bad.token.sig"}
                 )
                 assert resp.status == 401
             finally:
@@ -490,7 +586,7 @@ class TestDynamoProxy:
             try:
                 token = _make_jwt(exp_offset=-60)
                 resp = await client.get(
-                    "/v1/models", headers={"Authorization": f"Bearer {token}"}
+                    "/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}
                 )
                 assert resp.status == 401
             finally:
@@ -506,7 +602,7 @@ class TestDynamoProxy:
             try:
                 token = _make_jwt()
                 resp = await client.get(
-                    "/v1/models", headers={"Authorization": f"Bearer {token}"}
+                    "/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}
                 )
                 assert resp.status == 401
             finally:

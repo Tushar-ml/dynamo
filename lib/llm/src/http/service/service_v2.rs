@@ -63,6 +63,7 @@ pub struct State {
     auth_config: Arc<super::flexprice::AuthConfig>,
     flexprice_config: Arc<super::flexprice::FlexPriceConfig>,
     flexprice_client: Option<Arc<super::flexprice::FlexPriceClient>>,
+    flexprice_balance_checker: Option<Arc<super::flexprice::BalanceChecker>>,
 }
 
 #[derive(Default, Debug)]
@@ -136,6 +137,7 @@ impl State {
         auth_config: Arc<super::flexprice::AuthConfig>,
         flexprice_config: Arc<super::flexprice::FlexPriceConfig>,
         flexprice_client: Option<Arc<super::flexprice::FlexPriceClient>>,
+        flexprice_balance_checker: Option<Arc<super::flexprice::BalanceChecker>>,
     ) -> Self {
         Self {
             manager,
@@ -156,6 +158,7 @@ impl State {
             auth_config,
             flexprice_config,
             flexprice_client,
+            flexprice_balance_checker,
         }
     }
 
@@ -177,6 +180,11 @@ impl State {
     /// The FlexPrice billing client, if `DYN_FLEXPRICE_ENABLED=true`.
     pub fn flexprice_client(&self) -> Option<Arc<super::flexprice::FlexPriceClient>> {
         self.flexprice_client.clone()
+    }
+
+    /// The FlexPrice wallet-balance checker, if `DYN_FLEXPRICE_ENABLED=true`.
+    pub fn flexprice_balance_checker(&self) -> Option<Arc<super::flexprice::BalanceChecker>> {
+        self.flexprice_balance_checker.clone()
     }
 
     pub fn manager(&self) -> &ModelManager {
@@ -537,6 +545,9 @@ impl HttpServiceConfigBuilder {
                 &flexprice_config.api_key,
             )
         });
+        let flexprice_balance_checker = flexprice_config
+            .enabled
+            .then(|| super::flexprice::BalanceChecker::new(&flexprice_config));
         tracing::info!(
             auth_enabled = auth_config.enabled,
             flexprice_enabled = flexprice_config.enabled,
@@ -550,6 +561,7 @@ impl HttpServiceConfigBuilder {
             auth_config,
             flexprice_config,
             flexprice_client,
+            flexprice_balance_checker,
         ));
         state
             .flags

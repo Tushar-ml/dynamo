@@ -11,10 +11,12 @@
 use std::sync::Arc;
 
 use axum::extract::Request;
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use super::auth;
+use super::auth::{self, AuthError};
+use super::balance::BalanceStatus;
 use crate::http::service::service_v2;
 
 /// The JWT-verified org UUID. Inserted into the request's typed extension map
@@ -38,18 +40,41 @@ pub async fn auth_middleware(
         .to_string();
 
     let auth_config = state.auth_config();
-    match auth::authenticate(
+    let ctx = match auth::authenticate(
         &auth_header,
         &auth_config.secret_keys,
         &auth_config.valid_orgs,
     ) {
-        Ok(ctx) => {
-            // Request extensions are a server-internal typed map, never
-            // populated from client input, so there's no spoofing vector to
-            // guard against here (unlike a header-based propagation scheme).
-            request.extensions_mut().insert(OrgUuid(ctx.org_uuid));
-            next.run(request).await
+        Ok(ctx) => ctx,
+        Err(err) => return err.into_response(),
+    };
+
+    // Wallet balance gate: prepaid orgs below the configured minimum balance
+    // (negative by default) are blocked; postpaid orgs bypass this entirely.
+    // Only runs when FlexPrice billing is enabled — no wallet, no gate.
+    if let Some(checker) = state.flexprice_balance_checker() {
+        match checker.check(&ctx.org_uuid).await {
+            BalanceStatus::Ok => {}
+            BalanceStatus::Suspended => {
+                return AuthError {
+                    status: StatusCode::PAYMENT_REQUIRED,
+                    message: "Your account has been suspended. Please contact support to re-activate your account.".to_string(),
+                }
+                .into_response();
+            }
+            BalanceStatus::InsufficientBalance => {
+                return AuthError {
+                    status: StatusCode::PAYMENT_REQUIRED,
+                    message: "You have exhausted your wallet balance. Please add credits to resume using.".to_string(),
+                }
+                .into_response();
+            }
         }
-        Err(err) => err.into_response(),
     }
+
+    // Request extensions are a server-internal typed map, never populated
+    // from client input, so there's no spoofing vector to guard against here
+    // (unlike a header-based propagation scheme).
+    request.extensions_mut().insert(OrgUuid(ctx.org_uuid));
+    next.run(request).await
 }

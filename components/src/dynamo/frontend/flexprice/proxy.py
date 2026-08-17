@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 from .auth import AuthError, authenticate
+from .balance import BalanceChecker, BalanceStatus
 from .client import FlexPriceClient
 from .config import FlexPriceConfig
 
@@ -76,11 +77,13 @@ class DynamoProxy:
         backend_url: str,
         config: FlexPriceConfig,
         flexprice_client: Optional[FlexPriceClient] = None,
+        balance_checker: Optional[BalanceChecker] = None,
         model_name: str = "",
     ) -> None:
         self._backend = backend_url.rstrip("/")
         self._config = config
         self._client = flexprice_client  # None when DYN_FLEXPRICE_ENABLED=false
+        self._balance_checker = balance_checker  # None when DYN_FLEXPRICE_ENABLED=false
         self._model_name = model_name
         self._session: Optional[ClientSession] = None
 
@@ -90,10 +93,14 @@ class DynamoProxy:
             # No total timeout — requests may stream for an extended period.
             timeout=ClientTimeout(total=None, connect=10),
         )
+        if self._balance_checker:
+            await self._balance_checker.start()
 
     async def stop(self) -> None:
         if self._session:
             await self._session.close()
+        if self._balance_checker:
+            await self._balance_checker.stop()
 
     # Main handler
 
@@ -112,6 +119,24 @@ class DynamoProxy:
                 logger.warning("Auth failed: %s", exc)
                 return _json_error(exc.status, str(exc))
             org_id = auth_ctx.org_uuid
+
+            # Wallet balance gate: prepaid orgs below the configured minimum
+            # balance (negative by default) are blocked; postpaid orgs bypass
+            # this entirely. Only runs when FlexPrice billing is enabled.
+            if self._balance_checker:
+                status = await self._balance_checker.check(org_id)
+                if status is BalanceStatus.SUSPENDED:
+                    return _json_error(
+                        402,
+                        "Your account has been suspended. Please contact "
+                        "support to re-activate your account.",
+                    )
+                if status is BalanceStatus.INSUFFICIENT_BALANCE:
+                    return _json_error(
+                        402,
+                        "You have exhausted your wallet balance. Please add "
+                        "credits to resume using.",
+                    )
 
         # ---- 2. Forward to Dynamo Rust service ------------------------
         path = request.path
@@ -275,7 +300,7 @@ class DynamoProxy:
     ) -> None:
         assert self._client is not None
         event_name = self._config.resolve_event_name(model_name)
-        source = self._config.resolve_source_name(model_name)
+        source = self._config.resolve_source_name()
 
         properties: Dict[str, Any] = {
             "model_id": model_name,
@@ -346,21 +371,30 @@ async def run_proxy(
 ) -> None:
     """Start the Dynamo auth proxy and block until cancelled.
 
-    A FlexPriceClient is created only when DYN_FLEXPRICE_ENABLED=true so that
-    auth-only mode has zero FlexPrice overhead.
+    A FlexPriceClient (and wallet BalanceChecker) is created only when
+    DYN_FLEXPRICE_ENABLED=true so that auth-only mode has zero FlexPrice
+    overhead.
     """
     flexprice_client: Optional[FlexPriceClient] = None
+    balance_checker: Optional[BalanceChecker] = None
     if config.enabled:
         flexprice_client = FlexPriceClient(
             api_host=config.api_host,
             api_key=config.api_key,
         )
         await flexprice_client.start()
+        balance_checker = BalanceChecker(
+            api_host=config.api_host,
+            api_key=config.api_key,
+            minimum_balance=config.minimum_balance,
+        )
+        await balance_checker.start()
 
     proxy = DynamoProxy(
         backend_url=backend_url,
         config=config,
         flexprice_client=flexprice_client,
+        balance_checker=balance_checker,
         model_name=model_name,
     )
     await proxy.start()

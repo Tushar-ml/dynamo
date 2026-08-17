@@ -50,6 +50,11 @@ pub struct FlexPriceConfig {
     pub api_host: String,
     pub event_name: String,
     pub source_name: String,
+    pub deployment_name: String,
+    pub deployment_id: String,
+    /// Minimum wallet balance required for a prepaid org to be allowed
+    /// through. Postpaid orgs bypass this check entirely.
+    pub minimum_balance: f64,
 }
 
 impl FlexPriceConfig {
@@ -63,6 +68,14 @@ impl FlexPriceConfig {
                 .to_string(),
             event_name: std::env::var(env_llm::DYN_FLEXPRICE_EVENT_NAME).unwrap_or_default(),
             source_name: std::env::var(env_llm::DYN_FLEXPRICE_SOURCE_NAME).unwrap_or_default(),
+            deployment_name: std::env::var(env_llm::DYN_DEPLOYMENT_NAME)
+                .unwrap_or_else(|_| "dynamo".to_string()),
+            deployment_id: std::env::var(env_llm::DYN_DEPLOYMENT_ID)
+                .unwrap_or_else(|_| "local".to_string()),
+            minimum_balance: std::env::var(env_llm::DYN_FLEXPRICE_MINIMUM_BALANCE)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
         }
     }
 
@@ -105,14 +118,15 @@ impl FlexPriceConfig {
         }
     }
 
-    pub fn resolve_source_name(&self, model_name: &str) -> String {
+    /// Identifies which deployment served the request — mirrors go-proxy's
+    /// `{deployment_name}_{deployment_id}` billing source. Deliberately not
+    /// model-based: the model is already tracked separately as
+    /// `properties["model_id"]` on the billing event.
+    pub fn resolve_source_name(&self) -> String {
         if !self.source_name.is_empty() {
-            self.source_name.clone()
-        } else if model_name.is_empty() {
-            "dynamo".to_string()
-        } else {
-            model_name.to_string()
+            return self.source_name.clone();
         }
+        format!("{}_{}", self.deployment_name, self.deployment_id)
     }
 }
 
@@ -146,10 +160,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_source_name_defaults_to_model() {
-        let cfg = FlexPriceConfig::default();
-        assert_eq!(cfg.resolve_source_name("llama-3"), "llama-3");
-        assert_eq!(cfg.resolve_source_name(""), "dynamo");
+    fn resolve_source_name_defaults_to_deployment_name_and_id() {
+        let cfg = FlexPriceConfig {
+            deployment_name: "my-deployment".to_string(),
+            deployment_id: "dep-123".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_source_name(), "my-deployment_dep-123");
+    }
+
+    #[test]
+    fn resolve_source_name_prefers_override() {
+        let cfg = FlexPriceConfig {
+            source_name: "custom-source".to_string(),
+            deployment_name: "my-deployment".to_string(),
+            deployment_id: "dep-123".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_source_name(), "custom-source");
     }
 
     #[test]

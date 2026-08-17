@@ -314,8 +314,21 @@ pub mod llm {
     /// Override billing event name (default: "{model}-llm-usage")
     pub const DYN_FLEXPRICE_EVENT_NAME: &str = "DYN_FLEXPRICE_EVENT_NAME";
 
-    /// Override billing source name (default: "{model}")
+    /// Override billing source name (default: "{deployment_name}_{deployment_id}")
     pub const DYN_FLEXPRICE_SOURCE_NAME: &str = "DYN_FLEXPRICE_SOURCE_NAME";
+
+    /// Human-readable deployment name, used to build the default billing source
+    /// (default: "dynamo")
+    pub const DYN_DEPLOYMENT_NAME: &str = "DYN_DEPLOYMENT_NAME";
+
+    /// Deployment/instance id, used to build the default billing source
+    /// (default: "local")
+    pub const DYN_DEPLOYMENT_ID: &str = "DYN_DEPLOYMENT_ID";
+
+    /// Minimum wallet balance (in FlexPrice's currency units) required for a
+    /// prepaid org to be allowed to make inference requests. Postpaid orgs are
+    /// always allowed regardless of balance. (default: "0")
+    pub const DYN_FLEXPRICE_MINIMUM_BALANCE: &str = "DYN_FLEXPRICE_MINIMUM_BALANCE";
 
     /// Backend stream inactivity timeout in seconds.
     ///

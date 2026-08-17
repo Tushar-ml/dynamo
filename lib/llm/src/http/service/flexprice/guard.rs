@@ -48,7 +48,7 @@ impl UsageBillingGuard {
         let client = if org_uuid.is_empty() { None } else { client };
         Self {
             event_name: config.resolve_event_name(model),
-            source: config.resolve_source_name(model),
+            source: config.resolve_source_name(),
             client,
             org_uuid,
             model: model.to_string(),

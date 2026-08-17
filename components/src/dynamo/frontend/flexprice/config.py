@@ -22,8 +22,15 @@ class FlexPriceConfig:
         DYN_FLEXPRICE_API_KEY              - FlexPrice API key (required when enabled)
         DYN_FLEXPRICE_API_HOST             - FlexPrice API host, e.g. "api.flexprice.io"
         DYN_FLEXPRICE_EVENT_NAME           - Override billing event name (default: "{model}-llm-usage")
-        DYN_FLEXPRICE_SOURCE_NAME          - Override billing source name (default: "{model}")
+        DYN_FLEXPRICE_SOURCE_NAME          - Override billing source name (default: "{deployment_name}_{deployment_id}")
         DYN_FLEXPRICE_INTERNAL_PORT_OFFSET - Port offset for the internal Dynamo HTTP service (default: 1)
+        DYN_FLEXPRICE_MINIMUM_BALANCE      - Minimum wallet balance required for a prepaid org to be
+                                              allowed through (default: 0.0, i.e. block once negative).
+                                              Postpaid orgs bypass this check entirely.
+        DYN_DEPLOYMENT_NAME                - Human-readable deployment name, used in the default
+                                              billing source (default: "dynamo")
+        DYN_DEPLOYMENT_ID                  - Deployment/instance id, used in the default billing
+                                              source (default: "local")
     """
 
     # Auth (master switch for the proxy)
@@ -38,6 +45,9 @@ class FlexPriceConfig:
     event_name: str
     source_name: str
     internal_port_offset: int
+    minimum_balance: float
+    deployment_name: str
+    deployment_id: str
 
     @classmethod
     def from_env(cls) -> "FlexPriceConfig":
@@ -66,6 +76,11 @@ class FlexPriceConfig:
             internal_port_offset=int(
                 os.environ.get("DYN_FLEXPRICE_INTERNAL_PORT_OFFSET", "1")
             ),
+            minimum_balance=float(
+                os.environ.get("DYN_FLEXPRICE_MINIMUM_BALANCE", "0.0")
+            ),
+            deployment_name=os.environ.get("DYN_DEPLOYMENT_NAME", "dynamo"),
+            deployment_id=os.environ.get("DYN_DEPLOYMENT_ID", "local"),
         )
 
     def validate(self) -> None:
@@ -100,7 +115,12 @@ class FlexPriceConfig:
             return self.event_name
         return f"{model_name}-llm-usage" if model_name else "dynamo-llm-usage"
 
-    def resolve_source_name(self, model_name: str = "") -> str:
+    def resolve_source_name(self) -> str:
+        """Identifies which deployment served the request — mirrors go-proxy's
+        ``{deployment_name}_{deployment_id}`` billing source. Deliberately not
+        model-based: the model is already tracked separately as
+        ``properties["model_id"]`` on the billing event.
+        """
         if self.source_name:
             return self.source_name
-        return model_name if model_name else "dynamo"
+        return f"{self.deployment_name}_{self.deployment_id}"
