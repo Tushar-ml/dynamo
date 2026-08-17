@@ -31,4 +31,4 @@ pub use balance::{BalanceChecker, BalanceStatus};
 pub use client::FlexPriceClient;
 pub use config::{AuthConfig, FlexPriceConfig};
 pub use guard::UsageBillingGuard;
-pub use middleware::{OrgUuid, auth_middleware};
+pub use middleware::{OrgUuid, UserUuid, auth_middleware};
