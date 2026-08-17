@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 export PYTHONHASHSEED=0
 
 # Common configuration
-MODEL="Qwen/Qwen3-0.6B"
+MODEL="RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
 BLOCK_SIZE=64
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
@@ -20,6 +20,8 @@ print_launch_banner "Launching Aggregated + KV Routing (2 GPUs)" "$MODEL" "$HTTP
 
 # run frontend + KV router
 # dynamo.frontend accepts either --http-port flag or DYN_HTTP_PORT env var (defaults to 8000)
+# vLLM-native parsers (--tool-call-parser, --reasoning-parser) require
+# --dyn-chat-processor vllm on the frontend. See docs/backends/vllm/vllm-chat-processor.md.
 python -m dynamo.frontend \
     --router-mode kv \
     --router-reset-states &
@@ -34,17 +36,21 @@ python -m dynamo.frontend \
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT1:-8081} \
 CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm \
     --model $MODEL \
-    --block-size $BLOCK_SIZE \
-    --enforce-eager \
+    --block-size $BLOCK_SIZE --attention-backend GEMMA4_FLASH_ATTN --served-model-name google/gemma-4-26b-a4b-it \
+    --max-model-len 250000 --language-model-only --gpu-memory-utilization 0.95 \
+    --max-num-batched-tokens 16384 --max-num-seqs 16 --block-size 32 --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,80,96,128]}' \
+    --speculative-config='{"model": "google/gemma-4-26b-a4b-it-assistant", "num_speculative_tokens": 4}' \
+    --prefix-warmup-file "https://gist.githubusercontent.com/Tushar-ml/d9a8fa4f076f1585b19ebfa7d5c5ca8d/raw/312628f74aec1711e34357488aad6dc2d7692fe4/warmup.json"  \
+    --prefix-warmup-parallel --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4 \
     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' &
 
-DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT2:-8082} \
-VLLM_NIXL_SIDE_CHANNEL_PORT=20097 \
-CUDA_VISIBLE_DEVICES=1 python3 -m dynamo.vllm \
-    --model $MODEL \
-    --block-size $BLOCK_SIZE \
-    --enforce-eager \
-    --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20081","enable_kv_cache_events":true}' &
+# DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT2:-8082} \
+# VLLM_NIXL_SIDE_CHANNEL_PORT=20097 \
+# CUDA_VISIBLE_DEVICES=1 python3 -m dynamo.vllm \
+#     --model $MODEL \
+#     --block-size $BLOCK_SIZE \
+#     --enforce-eager \
+#     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20081","enable_kv_cache_events":true}' &
 
 # Exit on first worker failure; kill 0 in the EXIT trap tears down the rest
 wait_any_exit

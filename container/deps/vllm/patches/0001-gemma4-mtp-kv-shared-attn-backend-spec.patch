@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dynamo <dynamo@nvidia.com>
+Date: Sat, 23 May 2026 00:00:00 +0000
+Subject: [PATCH] Fix KV-shared draft layer attn backend spec lookup for Gemma4 MTP
+
+When Gemma4 MTP draft layers share KV cache with the target model, they are
+added to a target KV cache group but omitted from UniformTypeKVCacheSpecs.
+Resolve the shared target layer's spec instead of raising KeyError during
+initialize_attn_backend / CUDA graph profiling.
+---
+ vllm/v1/worker/gpu_model_runner.py | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a30e927..78b6db7 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -6722,7 +6722,24 @@ class GPUModelRunner(
+                 full_cls_name = attn_backend.full_cls_name()
+                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
++                    if layer_name in layer_kv_cache_spec.kv_cache_specs:
++                        layer_kv_cache_spec = (
++                            layer_kv_cache_spec.kv_cache_specs[layer_name]
++                        )
++                    else:
++                        tgt = getattr(
++                            layers[layer_name],
++                            "kv_sharing_target_layer_name",
++                            None,
++                        )
++                        if tgt and tgt in layer_kv_cache_spec.kv_cache_specs:
++                            layer_kv_cache_spec = (
++                                layer_kv_cache_spec.kv_cache_specs[tgt]
++                            )
++                        else:
++                            layer_kv_cache_spec = (
++                                layer_kv_cache_spec.kv_cache_specs[layer_name]
++                            )
+                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
+                 # expose ``num_heads``; fall back to 0 so they cluster as
+                 # before. Such layers never coexist with Attention in a

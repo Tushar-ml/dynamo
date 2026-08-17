@@ -262,6 +262,7 @@ pub struct Metrics {
     output_sequence_length: HistogramVec,
     cached_tokens: HistogramVec,
     tokenizer_latency: HistogramVec,
+    input_tokens_counter: IntCounterVec,
     output_tokens_counter: IntCounterVec,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
@@ -395,6 +396,7 @@ pub struct ResponseMetricCollector {
     metrics: Arc<Metrics>,
     model: String,
     start_time: Instant,
+    streaming: bool,
     // we use is_first_token to distinguish TTFT from ITL. It is true by default and
     // flipped to false when the first token is returned and TTFT is published.
     is_first_token: bool,
@@ -443,6 +445,7 @@ impl Metrics {
     /// - `{prefix}_input_sequence_tokens` - HistogramVec for input sequence length in tokens
     /// - `{prefix}_output_sequence_tokens` - HistogramVec for output sequence length in tokens
     /// - `{prefix}_tokenizer_latency_ms` - HistogramVec for tokenizer latency in milliseconds
+    /// - `{prefix}_input_tokens_total` - IntCounterVec for total input tokens processed (one increment per request)
     /// - `{prefix}_output_tokens_total` - IntCounterVec for total output tokens generated (real-time updates)
     /// - `{prefix}_time_to_first_token_seconds` - HistogramVec for time to first token in seconds
     /// - `{prefix}_inter_token_latency_seconds` - HistogramVec for inter-token latency in seconds
@@ -588,6 +591,15 @@ impl Metrics {
                 "Output sequence length in tokens",
             )
             .buckets(output_sequence_buckets),
+            &["model"],
+        )
+        .unwrap();
+
+        let input_tokens_counter = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::INPUT_TOKENS_TOTAL),
+                "Total number of input tokens processed (incremented once per request)",
+            ),
             &["model"],
         )
         .unwrap();
@@ -778,6 +790,7 @@ impl Metrics {
             output_sequence_length,
             cached_tokens,
             tokenizer_latency,
+            input_tokens_counter,
             output_tokens_counter,
             time_to_first_token,
             inter_token_latency,
@@ -932,6 +945,7 @@ impl Metrics {
         registry.register(Box::new(self.output_sequence_length.clone()))?;
         registry.register(Box::new(self.cached_tokens.clone()))?;
         registry.register(Box::new(self.tokenizer_latency.clone()))?;
+        registry.register(Box::new(self.input_tokens_counter.clone()))?;
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
         registry.register(Box::new(self.time_to_first_token.clone()))?;
         registry.register(Box::new(self.inter_token_latency.clone()))?;
@@ -1344,9 +1358,10 @@ impl ResponseMetricCollector {
         ResponseMetricCollector {
             metrics,
             model,
+            start_time: Instant::now(),
+            streaming: false,
             is_first_token: true,
             last_response_time: None,
-            start_time: Instant::now(),
             osl: 0,
             isl: 0,
             ttft_ms: None,
@@ -1407,6 +1422,11 @@ impl ResponseMetricCollector {
         self.is_first_token
     }
 
+    /// Mark this request as streaming so relay metrics use TTFT-based denominators.
+    pub fn set_streaming(&mut self, streaming: bool) {
+        self.streaming = streaming;
+    }
+
     /// Observe cached tokens (prefix cache hits), observing only once per request when value is available
     pub fn observe_cached_tokens(&mut self, cached_tokens: Option<usize>) {
         if let Some(tokens) = cached_tokens
@@ -1465,6 +1485,12 @@ impl ResponseMetricCollector {
             // NOTE: when there are multiple tokens in the first response,
             // we use the full response time as TTFT and ignore the ITL
             self.is_first_token = false;
+
+            // Increment the input tokens counter once per request (ISL is stable at first token)
+            self.metrics
+                .input_tokens_counter
+                .with_label_values(&[&self.model])
+                .inc_by(isl as u64);
 
             // Publish TTFT and store for span recording
             let ttft = self.start_time.elapsed().as_secs_f64();
@@ -1581,6 +1607,14 @@ impl Drop for ResponseMetricCollector {
         if let Some(worker_id) = self.decode_worker_id {
             span.record("decode_worker_id", worker_id);
         }
+
+        super::relay_metrics::emit(
+            self.streaming,
+            self.ttft_ms,
+            self.isl,
+            self.osl,
+            self.start_time.elapsed().as_secs_f64(),
+        );
     }
 }
 
@@ -2109,6 +2143,83 @@ mod tests {
                 .with_label_values(&[model2])
                 .get(),
             20
+        );
+    }
+
+    #[test]
+    fn test_input_tokens_counter_increments_once_per_request() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let model = "test-model";
+        let mut collector = metrics.clone().create_response_collector(model);
+
+        // First chunk: ISL=50, 5 output tokens — counter incremented once with isl=50
+        collector.observe_response(50, 5);
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model])
+                .get(),
+            50
+        );
+
+        // Second chunk: same request, isl still 50 — counter must NOT increment again
+        collector.observe_response(50, 10);
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model])
+                .get(),
+            50
+        );
+    }
+
+    #[test]
+    fn test_input_tokens_counter_multiple_models() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let model1 = "model-1";
+        let model2 = "model-2";
+
+        let mut collector1 = metrics.clone().create_response_collector(model1);
+        let mut collector2 = metrics.clone().create_response_collector(model2);
+
+        // First request on model1 with ISL=30
+        collector1.observe_response(30, 5);
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model1])
+                .get(),
+            30
+        );
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model2])
+                .get(),
+            0
+        );
+
+        // First request on model2 with ISL=80
+        collector2.observe_response(80, 3);
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model1])
+                .get(),
+            30
+        );
+        assert_eq!(
+            metrics
+                .input_tokens_counter
+                .with_label_values(&[model2])
+                .get(),
+            80
         );
     }
 

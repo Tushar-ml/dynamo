@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import socket
+import warnings
+from argparse import Namespace
 from typing import Any, Dict, Optional
 
 from vllm.distributed.kv_events import KVEventsConfig
@@ -32,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
-
 class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     component: str
     custom_jinja_template: Optional[str] = None
@@ -51,6 +52,10 @@ class Config(DynamoRuntimeConfig, DynamoVllmConfig):
 
     # rest vLLM args
     engine_args: AsyncEngineArgs
+    # vLLM OpenAI frontend flags (--tool-call-parser, etc.).
+    # Accepted for deployment compatibility; most are frontend-only and ignored
+    # on the worker. See dynamo.frontend for where they take effect.
+    frontend_args: Optional[Namespace] = None
 
     def validate(self) -> None:
         DynamoRuntimeConfig.validate(self)
@@ -86,14 +91,30 @@ def parse_args(argv: list[str] | None = None) -> Config:
     dynamo_vllm_argspec.add_arguments(parser)
 
     # trick to add vllm engine flags to a specific group without breaking the Dynamo groups.
+    vllm_parser = FlexibleArgumentParser(add_help=False)
+    AsyncEngineArgs.add_cli_args(vllm_parser, async_args_only=False)
+    engine_dests = {
+        action.dest
+        for action in vllm_parser._actions
+        if action.option_strings
+    }
+
+    try:
+        from vllm.entrypoints.openai.cli_args import FrontendArgs
+    except ImportError:
+        FrontendArgs = None  # type: ignore[misc, assignment]
+    else:
+        # Accepted on the worker for deployment compatibility; parsed from
+        # ``unknown`` via vllm_parser only (not registered on the Dynamo parser).
+        FrontendArgs.add_cli_args(vllm_parser)
+
     vg = parser.add_argument_group(
         "vLLM Engine Options. Please refer to vLLM documentation for more details."
     )
-    vllm_parser = FlexibleArgumentParser(add_help=False)
-    AsyncEngineArgs.add_cli_args(vllm_parser, async_args_only=False)
-
     for action in vllm_parser._actions:
         if not action.option_strings:
+            continue
+        if action.dest not in engine_dests:
             continue
         vg._group_actions.append(action)
 
@@ -104,6 +125,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     dynamo_config.validate()
 
     vllm_args = vllm_parser.parse_args(unknown)
+    _warn_frontend_only_worker_flags(dynamo_config, vllm_args)
+    dynamo_config.frontend_args = vllm_args
     # Set the model name from the command line arguments
     # model is defined in AsyncEngineArgs, but when AsyncEngineArgs.from_cli_args is called,
     # vllm will update the model name to the full path of the model, which will break the dynamo logic,
@@ -118,6 +141,33 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     dynamo_config.engine_args = engine_config
     return dynamo_config
+
+
+def _warn_frontend_only_worker_flags(
+    dynamo_config: Config, vllm_args: Namespace
+) -> None:
+    """Warn when frontend-only flags are passed to the vLLM worker."""
+    if (
+        dynamo_config.disaggregation_mode == DisaggregationMode.PREFILL
+        and _has_prefix_warmup_config(dynamo_config)
+    ):
+        warnings.warn(
+            "--prefix-warmup-* flags have no effect on prefill workers. "
+            "Pass them to decode or aggregated workers (python -m dynamo.vllm).",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
+def _has_prefix_warmup_config(dynamo_config: Config) -> bool:
+    if dynamo_config.prefix_warmup_file:
+        return True
+    if dynamo_config.prefix_warmup_count is not None:
+        return True
+    if dynamo_config.prefix_warmup_parallel:
+        return True
+    return False
+
 
 
 def cross_validate_config(

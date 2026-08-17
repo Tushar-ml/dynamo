@@ -19,6 +19,14 @@ ARG PYTHON_VERSION
 ARG ENABLE_KVBM
 ARG ENABLE_GPU_MEMORY_SERVICE
 ARG VLLM_OMNI_REF
+ARG VLLM_REPO
+ARG VLLM_REF
+ARG VLLM_CUDA_VERSION
+ARG VLLM_USE_PRECOMPILED
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT
+# Optional: pass --build-arg VLLM_PRECOMPILED_WHEEL_LOCATION=file:///path/to.whl
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION
+ARG MAX_JOBS
 ARG NIXL_REF
 {% if device == "cuda" %}
 ARG CUDA_MAJOR
@@ -27,6 +35,11 @@ ARG CUDA_MAJOR
 WORKDIR /workspace
 
 ENV DYNAMO_HOME=/opt/dynamo
+{% if context.vllm.vllm_ref %}
+ENV VLLM_USE_PRECOMPILED={{ context.vllm.vllm_use_precompiled }}
+ENV VLLM_MAIN_CUDA_VERSION={{ context.vllm.vllm_cuda_version }}
+ENV LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH:-}
+{% endif %}
 ENV HOME=/home/dynamo
 {% if device != "cuda" %}
 ENV PATH=/usr/local/ucx/bin:/usr/local/bin/etcd:${PATH}
@@ -167,6 +180,23 @@ RUN set -eux; \
         sox \
         libsox-fmt-all; \
     rm -rf /var/lib/apt/lists/*
+
+# Optionally replace upstream vLLM with a git fork (e.g. GEMMA4_FLASH_ATTN).
+RUN --mount=type=bind,source=./container/deps/vllm/protected_packages.txt,target=/tmp/vllm_omni_protected_packages.txt \
+    --mount=type=bind,source=./container/deps/vllm/install_vllm_fork.sh,target=/tmp/install_vllm_fork.sh \
+    --mount=type=bind,source=./container/deps/vllm/patches,target=/tmp/vllm-fork-patches \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    set -eux; \
+    export UV_CACHE_DIR=/root/.cache/uv; \
+    export VLLM_PATCHES_DIR=/tmp/vllm-fork-patches; \
+    export VLLM_REPO="${VLLM_REPO}"; \
+    export VLLM_REF="${VLLM_REF}"; \
+    export VLLM_CUDA_VERSION="${VLLM_CUDA_VERSION}"; \
+    export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}"; \
+    export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_PRECOMPILED_WHEEL_COMMIT}"; \
+    export VLLM_TARGET_DEVICE={{ device }}; \
+    export MAX_JOBS="${MAX_JOBS}"; \
+    bash /tmp/install_vllm_fork.sh
 
 # Layer the released vLLM-Omni package matching the pinned upstream ref while
 # constraining packages already solved in the upstream vLLM image.

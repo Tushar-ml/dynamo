@@ -120,6 +120,7 @@ mod tests {
             stream::iter(chunks),
             parser.to_string(),
             false,
+            false,
         );
         let mut output_stream = std::pin::pin!(output_stream);
         let mut all_reasoning = String::new();
@@ -164,6 +165,7 @@ mod tests {
         let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
             input_stream,
             runtime_config.reasoning_parser.unwrap(),
+            false,
             false,
         );
 
@@ -211,6 +213,7 @@ mod tests {
             input_stream,
             runtime_config.reasoning_parser.unwrap(),
             false,
+            false,
         );
 
         // Pin the stream and collect all output chunks
@@ -256,6 +259,7 @@ mod tests {
             input_stream,
             runtime_config.reasoning_parser.unwrap(),
             false,
+            false,
         );
 
         // Pin the stream and collect all output chunks
@@ -291,6 +295,7 @@ mod tests {
         let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
             input_stream,
             runtime_config.reasoning_parser.unwrap(),
+            false,
             false,
         );
 
@@ -334,6 +339,7 @@ mod tests {
         let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
             input_stream,
             runtime_config.reasoning_parser.unwrap(),
+            false,
             false,
         );
 
@@ -404,6 +410,7 @@ mod tests {
         let output_stream = OpenAIPreprocessor::parse_reasoning_content_from_stream(
             input_stream,
             "gpt_oss".to_string(),
+            false,
             false,
         );
 
@@ -546,6 +553,7 @@ mod tests {
             input_stream,
             "nemotron_deci".to_string(),
             false,
+            false,
         );
 
         // Step 2: Apply tool calling jail transformation
@@ -661,6 +669,7 @@ mod tests {
             input_stream,
             "kimi_k25".to_string(),
             false,
+            false,
         );
 
         // Step 2: tool calling jail (kimi_k2) extracts tool calls from remaining content
@@ -754,6 +763,7 @@ mod tests {
             input_stream,
             "gpt_oss".to_string(),
             false,
+            false,
         );
 
         let mut debug_stream = std::pin::pin!(reasoning_parsed_stream);
@@ -823,6 +833,7 @@ mod tests {
             stream::iter(chunks),
             parser.to_string(),
             true,
+            false,
         );
         let mut output_stream = std::pin::pin!(output_stream);
         let mut all_reasoning = String::new();

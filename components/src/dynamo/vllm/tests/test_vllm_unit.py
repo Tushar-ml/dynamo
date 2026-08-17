@@ -928,3 +928,50 @@ class TestEmbeddingWorkerFlag:
             ValueError, match="--embedding-worker cannot be combined with multimodal"
         ):
             parse_args()
+
+
+class TestVllmFrontendCompatibilityFlags:
+    """vLLM frontend flags are accepted on the worker for deployment compatibility."""
+
+    def test_accepts_tool_call_flags_on_worker(self, mock_vllm_cli):
+        mock_vllm_cli(
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "gemma4",
+        )
+        config = parse_args()
+
+        assert config.frontend_args is not None
+        assert config.frontend_args.tool_call_parser == "gemma4"
+        assert config.frontend_args.enable_auto_tool_choice is True
+
+    def test_accepts_prefix_warmup_flags(self, mock_vllm_cli):
+        mock_vllm_cli(
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--disaggregation-mode",
+            "decode",
+            "--prefix-warmup-file",
+            "/tmp/warmup.json",
+            "--prefix-warmup-count",
+            "3",
+            "--prefix-warmup-parallel",
+        )
+        config = parse_args()
+        assert config.prefix_warmup_file == "/tmp/warmup.json"
+        assert config.prefix_warmup_count == 3
+        assert config.prefix_warmup_parallel is True
+
+    def test_warns_prefix_warmup_on_prefill_worker(self, mock_vllm_cli):
+        mock_vllm_cli(
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--disaggregation-mode",
+            "prefill",
+            "--prefix-warmup-file",
+            "/tmp/warmup.json",
+        )
+        with pytest.warns(UserWarning, match="--prefix-warmup-"):
+            parse_args()

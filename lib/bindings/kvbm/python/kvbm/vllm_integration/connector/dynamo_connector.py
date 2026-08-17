@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -41,7 +42,7 @@ class DynamoConnectorMetadata(KVConnectorMetadata):
         self.metadata = metadata
 
 
-class DynamoConnector(KVConnectorBase_V1):
+class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -97,6 +98,24 @@ class DynamoConnector(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         return self._scheduler.request_finished(request, block_ids)
+
+    @nvtx_annotate(category="scheduler")
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # SupportsHMA hook. KVBM only registers the main-attention KV cache
+        # group (see _select_main_attention_shape_group in connector_worker.py);
+        # the sliding-window group is not tracked. Delegate the main-attention
+        # group's blocks to the existing request_finished path. For hybrid
+        # models like Gemma-4 the main-attention group always has more blocks
+        # per request than the sliding-window group (which is bounded by the
+        # window size), so picking the largest group is safe and correct.
+        if not block_ids:
+            return False, None
+        main_group_blocks = max(block_ids, key=len)
+        return self._scheduler.request_finished(request, main_group_blocks)
 
     # Worker
 

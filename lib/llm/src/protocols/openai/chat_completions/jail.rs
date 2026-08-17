@@ -12,7 +12,7 @@ use dynamo_parsers::tool_calling::json::try_tool_call_parse_basic_json;
 use dynamo_parsers::tool_calling::parsers::get_tool_parser_map;
 use dynamo_parsers::tool_calling::{
     detect_tool_call_start, find_tool_call_end_position, try_tool_call_parse_aggregate,
-    try_tool_call_parse_aggregate_stream_finalize,
+    try_tool_call_parse_aggregate_finalize, StreamingContentCleaner,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{Stream, StreamExt};
@@ -25,6 +25,10 @@ use super::NvCreateChatCompletionStreamResponse;
 
 fn is_harmony_parser(parser: Option<&str>) -> bool {
     parser == Some("harmony")
+}
+
+fn is_gemma4_parser(parser: Option<&str>) -> bool {
+    matches!(parser, Some("gemma4") | Some("gemma-4"))
 }
 
 fn contains_harmony_protocol(text: &str) -> bool {
@@ -123,6 +127,9 @@ struct ChoiceJailState {
     emitted_tool_calls_count: usize,
     /// Reasoning content collected while waiting for a suitable emission.
     pending_reasoning_content: Option<String>,
+    /// Raw cumulative visible text for Gemma4 prefix-diff cleaning before tool calls.
+    visible_raw_cumulative: String,
+    gemma4_content_cleaner: StreamingContentCleaner,
 }
 
 fn create_choice_stream(
@@ -163,6 +170,49 @@ impl ChoiceJailState {
             stream_finish_reason: None,
             emitted_tool_calls_count: 0,
             pending_reasoning_content: None,
+            visible_raw_cumulative: String::new(),
+            gemma4_content_cleaner: StreamingContentCleaner::new(),
+        }
+    }
+
+    /// Prefix-diff visible content for Gemma4 pre-tool streaming (vLLM PR #5 parity).
+    fn visible_content_for_emission(
+        &mut self,
+        jail_stream: &JailedStream,
+        raw_segment: &str,
+    ) -> Option<String> {
+        if raw_segment.is_empty() {
+            return None;
+        }
+        if !is_gemma4_parser(jail_stream.tool_call_parser.as_deref()) {
+            return Some(raw_segment.to_string());
+        }
+        let previous = self.visible_raw_cumulative.clone();
+        self.visible_raw_cumulative.push_str(raw_segment);
+        let current = self.visible_raw_cumulative.clone();
+        self.gemma4_content_cleaner
+            .pre_tool_content_delta(&previous, &current, raw_segment)
+    }
+
+    fn push_visible_emission(
+        &mut self,
+        emissions: &mut Vec<ChoiceEmission>,
+        choice: &ChatChoiceStream,
+        raw_segment: &str,
+        jail_stream: &JailedStream,
+        emission: impl Fn(ChatChoiceStream) -> ChoiceEmission,
+    ) {
+        if let Some(cleaned) = self.visible_content_for_emission(jail_stream, raw_segment) {
+            #[allow(deprecated)]
+            let visible_choice = create_choice_stream(
+                choice.index,
+                choice.delta.role,
+                &cleaned,
+                None,
+                choice.finish_reason,
+                choice.logprobs.clone(),
+            );
+            emissions.push(emission(visible_choice));
         }
     }
 
@@ -231,16 +281,13 @@ impl ChoiceJailState {
 
                     // Emit prefix if any
                     if !prefix.is_empty() && !prefix_has_harmony_protocol {
-                        #[allow(deprecated)]
-                        let prefix_choice = create_choice_stream(
-                            choice.index,
-                            choice.delta.role,
+                        self.push_visible_emission(
+                            &mut emissions,
+                            choice,
                             &prefix,
-                            None,
-                            choice.finish_reason,
-                            choice.logprobs.clone(),
+                            jail_stream,
+                            ChoiceEmission::PassThrough,
                         );
-                        emissions.push(ChoiceEmission::PassThrough(prefix_choice));
                     }
 
                     // Build the potential full content
@@ -285,16 +332,13 @@ impl ChoiceJailState {
                                 // No logprobs to seed here — they were already emitted with the tool call
                                 self.accumulated_logprobs = None;
                             } else {
-                                #[allow(deprecated)]
-                                let trailing_choice = create_choice_stream(
-                                    choice.index,
-                                    choice.delta.role,
+                                self.push_visible_emission(
+                                    &mut emissions,
+                                    choice,
                                     trailing_part,
-                                    None,
-                                    choice.finish_reason,
-                                    choice.logprobs.clone(),
+                                    jail_stream,
+                                    ChoiceEmission::Trailing,
                                 );
-                                emissions.push(ChoiceEmission::Trailing(trailing_choice));
                             }
                         }
                     } else {
@@ -325,16 +369,13 @@ impl ChoiceJailState {
 
                     // Emit the safe prefix
                     if !prefix.is_empty() {
-                        #[allow(deprecated)]
-                        let prefix_choice = create_choice_stream(
-                            choice.index,
-                            choice.delta.role,
+                        self.push_visible_emission(
+                            &mut emissions,
+                            choice,
                             &prefix,
-                            None,
-                            choice.finish_reason,
-                            choice.logprobs.clone(),
+                            jail_stream,
+                            ChoiceEmission::PassThrough,
                         );
-                        emissions.push(ChoiceEmission::PassThrough(prefix_choice));
                     }
 
                     // Hold the partial for next chunk
@@ -366,16 +407,13 @@ impl ChoiceJailState {
                     } else {
                         // No markers - emit everything
                         if !content.is_empty() {
-                            #[allow(deprecated)]
-                            let pass_through_choice = create_choice_stream(
-                                choice.index,
-                                choice.delta.role,
+                            self.push_visible_emission(
+                                &mut emissions,
+                                choice,
                                 &content,
-                                None,
-                                choice.finish_reason,
-                                choice.logprobs.clone(),
+                                jail_stream,
+                                ChoiceEmission::PassThrough,
                             );
-                            emissions.push(ChoiceEmission::PassThrough(pass_through_choice));
                         }
                         self.partial_match_buffer.clear();
                     }

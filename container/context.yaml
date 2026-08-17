@@ -63,6 +63,15 @@ vllm:
     base_image_tag: 22.04
     runtime_image_tag: v0.21.0
   flashinf_ref: v0.6.8.post1
+  # Optional: reinstall vLLM from a git fork on top of the upstream runtime image.
+  # Leave vllm_ref empty to keep the vLLM wheel shipped in vllm/vllm-openai.
+  vllm_repo: "https://github.com/Tushar-ml/vllm.git"
+  vllm_ref: "c301d749c1267fe65a80a0c6e84d7fdac4c5dd4e"
+  # CUDA variant for torch + precompiled wheels; must match runtime_image_tag (cu129).
+  vllm_cuda_version: "12.9"
+  vllm_use_precompiled: "1"
+  # nightly | <git-sha> | file:///path/to/vllm-*.whl (via VLLM_PRECOMPILED_WHEEL_LOCATION)
+  vllm_precompiled_wheel_commit: "nightly"
   vllm_omni_ref: "v0.21.0rc1"
   nixl_ref: v1.1.0
   max_jobs: "10"

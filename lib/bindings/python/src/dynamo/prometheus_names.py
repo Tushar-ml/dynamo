@@ -102,6 +102,8 @@ class frontend_service:
     CACHED_TOKENS = "cached_tokens"
     # Tokenizer latency in milliseconds
     TOKENIZER_LATENCY_MS = "tokenizer_latency_ms"
+    # Total number of input tokens processed (counter, incremented once per request)
+    INPUT_TOKENS_TOTAL = "input_tokens_total"
     # Total number of output tokens generated (counter that updates in real-time)
     OUTPUT_TOKENS_TOTAL = "output_tokens_total"
     # Time to first token in seconds

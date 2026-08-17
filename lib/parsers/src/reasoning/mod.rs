@@ -129,9 +129,9 @@ pub trait ReasoningParser: Send + std::fmt::Debug {
     ///
     /// Incremental parsing may buffer a partial delimiter prefix instead of
     /// emitting it immediately because the next chunk could complete a marker
-    /// like `<think>` or `</think>`. At EOF, no next chunk is coming, so the
-    /// parser must flush the undecided bytes as normal or reasoning text based
-    /// on its current state.
+    /// like `<|channel>` or `<channel|>`. At EOF, no next chunk is coming, so
+    /// the parser must flush the undecided bytes as normal or reasoning text
+    /// based on its current state.
     fn finish_reasoning_stream(&mut self) -> ParserResult {
         ParserResult::default()
     }

@@ -155,6 +155,7 @@ async fn parse_response_stream(
                 stream,
                 reasoning_parser,
                 false,
+                false,
             ))
         } else {
             Box::pin(stream)

@@ -22,6 +22,17 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils.async_utils import AsyncMicrobatchTokenizer
 
+from .gemma4_format import (
+    StreamingContentCleaner,
+    has_gemma4_tool_markup,
+    strip_leaked_empty_thinking,
+    strip_tool_call_suffix,
+)
+from .gemma4_rust_fallback import (
+    extract_gemma4_tool_calls_rust_sync,
+    vllm_extraction_needs_rust_fallback,
+)
+
 
 class _Renderer(Protocol):
     """Structural type for vLLM's chat-template renderer."""
@@ -225,6 +236,8 @@ class StreamingPostProcessor:
         tool_parser: ToolParser | None,
         reasoning_parser_class: type[ReasoningParser] | None,
         chat_template_kwargs: dict[str, Any],
+        stream_response: bool = True,
+        tool_parser_name: str | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.request_for_sampling = request_for_sampling
@@ -270,6 +283,14 @@ class StreamingPostProcessor:
         # this correctly, so we accumulate text here and fall back to the
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
+        self.stream_response = stream_response
+        self._gemma4_tools = tool_parser_name in ("gemma4", "gemma-4")
+        self._non_streaming_buffer = ""
+        self._thinking_disabled = thinking_disabled
+        self._use_prefix_content_cleaner = self._gemma4_tools or self._thinking_disabled
+        self._content_cleaner = (
+            StreamingContentCleaner() if self._use_prefix_content_cleaner else None
+        )
 
     @staticmethod
     def _merge_tool_call(
@@ -311,6 +332,48 @@ class StreamingPostProcessor:
             and self.request_for_sampling.tool_choice != "none"
         )
 
+    def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
+        return (
+            not self.stream_response
+            and self._should_parse_tools()
+        )
+
+    def _tools_json_for_rust(self) -> list[dict[str, Any]] | None:
+        if not self.request_for_sampling.tools:
+            return None
+        return [tool.model_dump() for tool in self.request_for_sampling.tools]
+
+    def _try_gemma4_rust_fallback(
+        self, text: str
+    ) -> tuple[list[DeltaToolCall], str | None] | None:
+        if not self._gemma4_tools:
+            return None
+        return extract_gemma4_tool_calls_rust_sync(text, self._tools_json_for_rust())
+
+    def _clean_visible_content(self, content: str | None) -> str | None:
+        if not content:
+            return content
+        if self._gemma4_tools or self._thinking_disabled:
+            cleaned = strip_tool_call_suffix(strip_leaked_empty_thinking(content)).strip()
+            return cleaned if cleaned else None
+        return content
+
+    def _streaming_content_delta(
+        self,
+        *,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> str | None:
+        if self._content_cleaner is not None:
+            return self._content_cleaner.pre_tool_content_delta(
+                previous_text,
+                current_text,
+                delta_text,
+            )
+        cleaned = self._clean_visible_content(delta_text)
+        return cleaned if cleaned else None
+
     @staticmethod
     def _compose_delta_message(
         reasoning: str | None, content: str | None
@@ -343,9 +406,72 @@ class StreamingPostProcessor:
         if extracted.tools_called:
             for i, tool_call in enumerate(extracted.tool_calls):
                 self._add_tool_call_from_extracted(i, tool_call)
-            return self._compose_delta_message(saved_reasoning, None)
+            return self._compose_delta_message(
+                saved_reasoning,
+                self._clean_visible_content(extracted.content),
+            )
 
-        return self._compose_delta_message(saved_reasoning, extracted.content or None)
+        if vllm_extraction_needs_rust_fallback(
+            text,
+            tools_called=False,
+            content=extracted.content,
+        ):
+            rust_result = self._try_gemma4_rust_fallback(text)
+            if rust_result is not None:
+                tool_deltas, normal_text = rust_result
+                for td in tool_deltas:
+                    existing = self.in_progress_tool_calls.get(td.index)
+                    self.in_progress_tool_calls[td.index] = self._merge_tool_call(
+                        existing, td
+                    )
+                return self._compose_delta_message(
+                    saved_reasoning,
+                    self._clean_visible_content(normal_text),
+                )
+
+        fallback_content = extracted.content or (
+            text if not has_gemma4_tool_markup(text) else None
+        )
+        return self._compose_delta_message(
+            saved_reasoning,
+            self._clean_visible_content(fallback_content),
+        )
+
+    def _process_non_streaming_tool_output(
+        self,
+        output: Any,
+        *,
+        current_text: str,
+        current_token_ids: list[int],
+    ) -> dict[str, Any] | None:
+        self._non_streaming_buffer = current_text
+        if not output.finish_reason:
+            self.previous_text = current_text
+            self.previous_token_ids = current_token_ids
+            return None
+
+        tool_parse_text = current_text
+        delta_message = self._extract_tool_calls_from_text(tool_parse_text)
+        if delta_message and delta_message.tool_calls:
+            self._merge_streaming_tool_calls(delta_message.tool_calls)
+
+        if self.in_progress_tool_calls:
+            return self._emit_tool_calls_choice(output)
+
+        content = None
+        if delta_message and delta_message.content:
+            content = delta_message.content
+        elif delta_message and delta_message.reasoning:
+            pass
+        elif tool_parse_text and not has_gemma4_tool_markup(tool_parse_text):
+            content = self._clean_visible_content(tool_parse_text)
+
+        delta: dict[str, Any] = {"role": "assistant"}
+        if delta_message and delta_message.reasoning:
+            delta["reasoning_content"] = delta_message.reasoning
+        if content:
+            delta["content"] = content
+        return self._build_choice(output, delta)
 
     def _extract_tool_calls_streaming(
         self,
@@ -411,6 +537,8 @@ class StreamingPostProcessor:
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
+        if output.finish_reason and "role" not in delta:
+            delta = {"role": "assistant", **delta}
         return {
             "index": output.index,
             "delta": delta,
@@ -427,21 +555,51 @@ class StreamingPostProcessor:
         delta_text = output.text or ""
         delta: dict[str, Any] = {}
         if self._fast_plain_text:
+            current_text = self.previous_text + delta_text
             if delta_text:
+                cleaned = self._streaming_content_delta(
+                    previous_text=self.previous_text,
+                    current_text=current_text,
+                    delta_text=delta_text,
+                )
+                if not cleaned:
+                    if output.finish_reason:
+                        delta = {}
+                    else:
+                        self.previous_text = current_text
+                        return None
+                    self.previous_text = current_text
+                    return self._build_choice(output, delta)
                 delta = {
                     "role": "assistant",
-                    "content": delta_text,
+                    "content": cleaned,
                 }
             elif output.finish_reason:
                 delta = {}
             else:
                 return None
+            self.previous_text = current_text
             return self._build_choice(output, delta)
 
         current_text = self.previous_text + delta_text
         current_token_ids = self.previous_token_ids + delta_token_ids
 
-        delta_message: DeltaMessage | None = DeltaMessage(content=delta_text)
+        if self._should_buffer_for_non_streaming_tool_parse():
+            return self._process_non_streaming_tool_output(
+                output,
+                current_text=current_text,
+                current_token_ids=current_token_ids,
+            )
+
+        delta_message: DeltaMessage | None = DeltaMessage(
+            content=self._streaming_content_delta(
+                previous_text=self.previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+            )
+            if delta_text
+            else None
+        )
 
         # ------------------------------------------------------------------
         # Drain the tool-text buffer (populated when </think> and <tool_call>
@@ -551,6 +709,19 @@ class StreamingPostProcessor:
                         current_token_ids=current_token_ids,
                         delta_token_ids=delta_token_ids,
                     )
+
+        if (
+            output.finish_reason
+            and self._gemma4_tools
+            and self._should_parse_tools()
+            and not self.in_progress_tool_calls
+            and has_gemma4_tool_markup(current_text)
+            and (
+                delta_message is None
+                or not (delta_message.tool_calls if delta_message else None)
+            )
+        ):
+            delta_message = self._extract_tool_calls_from_text(current_text)
 
         choice = None
         if delta_message is None:

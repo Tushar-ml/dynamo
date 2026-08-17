@@ -24,6 +24,10 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
+from dynamo.common.utils.tokenizer_utils import (
+    normalize_prompt_token_ids as _normalize_prompt_token_ids,
+)
+
 from .utils import random_call_id
 
 logger = logging.getLogger(__name__)
@@ -466,19 +470,6 @@ def build_tool_call_guided_decoding(
             return {"structural_tag": tag_value}
 
     return None
-
-
-def _normalize_prompt_token_ids(prompt_token_ids: Any) -> list[int]:
-    """Flatten ``apply_chat_template`` output to ``list[int]``.
-
-    On transformers v5 the default ``TokenizersBackend`` returns a
-    ``BatchEncoding`` from ``apply_chat_template(..., tokenize=True)``;
-    unwrap to ``.input_ids`` (a flat list for a single conversation).
-    """
-    ids = getattr(prompt_token_ids, "input_ids", prompt_token_ids)
-    if isinstance(ids, dict):
-        ids = ids.get("input_ids", prompt_token_ids)
-    return list(ids)
 
 
 def preprocess_chat_request(

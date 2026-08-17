@@ -214,6 +214,9 @@ pub mod frontend_service {
     /// Tokenizer latency in milliseconds
     pub const TOKENIZER_LATENCY_MS: &str = "tokenizer_latency_ms";
 
+    /// Total number of input tokens processed (counter, incremented once per request)
+    pub const INPUT_TOKENS_TOTAL: &str = "input_tokens_total";
+
     /// Total number of output tokens generated (counter that updates in real-time)
     pub const OUTPUT_TOKENS_TOTAL: &str = "output_tokens_total";
 

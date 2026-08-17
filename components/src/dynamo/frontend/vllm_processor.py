@@ -36,6 +36,8 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fetch_model
 
+from dynamo.common.metrics_relay import get_metrics_relay_client, resolve_deployment
+
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .utils import (
     extract_mm_urls,
@@ -130,6 +132,7 @@ class VllmProcessor:
         routed_engine: RoutedEngine,
         block_size: int = 16,
         enable_auto_tool_choice: bool = False,
+        tool_parser_name: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.input_processor = input_processor
@@ -137,6 +140,7 @@ class VllmProcessor:
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
         self.reasoning_parser_class = reasoning_parser_class
+        self.tool_parser_name = tool_parser_name
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
         self.enable_auto_tool_choice = enable_auto_tool_choice
@@ -499,6 +503,8 @@ class VllmProcessor:
                     tool_parser=tool_parser,
                     reasoning_parser_class=self.reasoning_parser_class,
                     chat_template_kwargs=chat_template_kwargs,
+                    stream_response=bool(request.get("stream", True)),
+                    tool_parser_name=self.tool_parser_name,
                 )
 
             # StreamingPostProcessor keeps delta/tool/reasoning parser state, so
@@ -581,6 +587,11 @@ class VllmProcessor:
                 output_request_ids[output_idx] = child_request_id
                 registered_request_ids.append(child_request_id)
 
+        t_start = time.monotonic()
+        t_first: float | None = None
+        total_output_tokens = 0
+        last_usage: dict[str, Any] | None = None
+
         try:
             _inject_routing_metadata(dynamo_preproc, dynamo_preproc, mm_routing_info)
             with _nvtx.annotate("mm_frontend:routed_engine_generate", color="red"):
@@ -616,6 +627,7 @@ class VllmProcessor:
                     yield handle_engine_error(engine_response, request_id, logger)
                     break
 
+                total_output_tokens += len(engine_response["token_ids"])
                 output_idx = engine_response.get("index", 0) or 0
                 output_request_id = output_request_ids.get(output_idx)
                 if output_request_id is None:
@@ -688,13 +700,56 @@ class VllmProcessor:
                     }
                     if usage := engine_response.get("completion_usage"):
                         dynamo_out["usage"] = usage
+                        last_usage = usage
 
+                    if t_first is None:
+                        t_first = time.monotonic()
                     yield dynamo_out
             _nvtx.end_range(rng_stream)
         except Exception as e:
             logger.exception("Error generating response for request %s", request_id)
             yield make_internal_error(request_id, str(e))
         finally:
+            metrics_client = get_metrics_relay_client()
+            if metrics_client is not None and t_first is not None:
+                t_end = time.monotonic()
+                streaming = bool(request.get("stream", False))
+                deployment = resolve_deployment(request.get("model"))
+                ttft_sec = (t_first - t_start) if streaming else (t_end - t_start)
+                total_sec = max(t_end - t_start, 1e-9)
+                input_tokens = len(tokens)
+                output_tokens = (
+                    last_usage.get("completion_tokens", total_output_tokens)
+                    if last_usage
+                    else total_output_tokens
+                )
+                input_denom = max(ttft_sec, 1e-9) if streaming else total_sec
+                output_denom = max(t_end - t_first, 1e-9) if streaming else total_sec
+                metrics_client.capture_generic_metric(
+                    "ttft", deployment, int(ttft_sec * 1000), streaming
+                )
+                if input_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "input_throughput",
+                        deployment,
+                        int(input_tokens / input_denom),
+                        streaming,
+                    )
+                if output_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "output_throughput",
+                        deployment,
+                        int(output_tokens / output_denom),
+                        streaming,
+                    )
+                total_tokens = input_tokens + output_tokens
+                if total_tokens > 0:
+                    metrics_client.capture_generic_metric(
+                        "total_throughput",
+                        deployment,
+                        int(total_tokens / total_sec),
+                        streaming,
+                    )
             for output_request_id in registered_request_ids:
                 if output_request_id in self.output_processor.request_states:
                     self.output_processor.abort_requests(
@@ -842,6 +897,7 @@ class EngineFactory:
             routed_engine,
             block_size=block_size,
             enable_auto_tool_choice=enable_auto_tool_choice,
+            tool_parser_name=tool_parser_name,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none

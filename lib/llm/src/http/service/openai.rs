@@ -581,6 +581,7 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.set_streaming(streaming);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -751,6 +752,7 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.set_streaming(streaming);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1452,6 +1454,7 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.set_streaming(streaming);
 
     let annotations = request.annotations();
 
@@ -1893,6 +1896,7 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.set_streaming(streaming);
 
     tracing::trace!("Issuing generate call for responses");
 
