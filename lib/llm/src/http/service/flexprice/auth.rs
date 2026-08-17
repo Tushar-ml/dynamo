@@ -49,8 +49,14 @@ impl IntoResponse for AuthError {
 /// Decoded claims from a validated JWT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthCtx {
-    pub user_uuid: String,
+    /// The `uuid` claim — identifies the token's subject (e.g. a TeamMember
+    /// record), not the actual user. Kept only because the claim is
+    /// mandatory; use `user_uuid` for the real user identity.
+    pub subject_uuid: String,
     pub org_uuid: String,
+    /// The `user_uuid` claim — the actual user id, used for billing
+    /// attribution. Empty when the token doesn't carry it.
+    pub user_uuid: String,
     pub token_uuid: String,
 }
 
@@ -152,7 +158,7 @@ pub fn authenticate(
 
     let claims = verify_jwt(token, secret_keys)?;
 
-    let user_uuid = claims
+    let subject_uuid = claims
         .get("uuid")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -162,13 +168,18 @@ pub fn authenticate(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let user_uuid = claims
+        .get("user_uuid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let token_uuid = claims
         .get("token_uuid")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
 
-    if user_uuid.is_empty() {
+    if subject_uuid.is_empty() {
         return Err(AuthError::new("token is missing the 'uuid' claim"));
     }
     if org_uuid.is_empty() {
@@ -181,8 +192,9 @@ pub fn authenticate(
     }
 
     Ok(AuthCtx {
-        user_uuid,
+        subject_uuid,
         org_uuid,
+        user_uuid,
         token_uuid,
     })
 }
@@ -222,8 +234,9 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let claims = serde_json::json!({
-            "uuid": "user-1",
+            "uuid": "subject-1",
             "org_uuid": org_uuid,
+            "user_uuid": "user-1",
             "token_uuid": "token-1",
             "exp": now + exp_offset_secs,
         });
@@ -236,6 +249,7 @@ mod tests {
         let t = token("HS256", "secret", "org-1", 300);
         let ctx = authenticate(&format!("Bearer {t}"), &["secret".to_string()], &[]).unwrap();
         assert_eq!(ctx.org_uuid, "org-1");
+        assert_eq!(ctx.subject_uuid, "subject-1");
         assert_eq!(ctx.user_uuid, "user-1");
     }
 

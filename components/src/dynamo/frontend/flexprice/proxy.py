@@ -130,6 +130,7 @@ class DynamoProxy:
     async def handle(self, request: web.Request) -> web.StreamResponse:
         # ---- 1. Authentication (skipped for system routes) -------------
         org_id = ""
+        user_id = ""
         if request.path not in _UNAUTHENTICATED_PATHS:
             auth_header = request.headers.get("Authorization", "")
             try:
@@ -142,6 +143,7 @@ class DynamoProxy:
                 logger.warning("Auth failed: %s", exc)
                 return _json_error(exc.status, str(exc))
             org_id = auth_ctx.org_uuid
+            user_id = auth_ctx.user_uuid
 
             # Wallet balance gate: prepaid orgs below the configured minimum
             # balance (negative by default) are blocked; postpaid orgs bypass
@@ -214,6 +216,7 @@ class DynamoProxy:
                         resp_headers,
                         is_metered=is_metered,
                         org_id=org_id,
+                        user_id=user_id,
                         request_id=request_id,
                         model_name=model_name,
                         start=start,
@@ -224,6 +227,7 @@ class DynamoProxy:
                         resp_headers,
                         is_metered=is_metered,
                         org_id=org_id,
+                        user_id=user_id,
                         request_id=request_id,
                         model_name=model_name,
                         start=start,
@@ -242,6 +246,7 @@ class DynamoProxy:
         *,
         is_metered: bool,
         org_id: str,
+        user_id: str,
         request_id: str,
         model_name: str,
         start: float,
@@ -272,6 +277,7 @@ class DynamoProxy:
         if is_metered and usage:
             self._emit_usage(
                 org_id=org_id,
+                user_id=user_id,
                 request_id=request_id,
                 model_name=model_name,
                 usage=usage,
@@ -290,6 +296,7 @@ class DynamoProxy:
         *,
         is_metered: bool,
         org_id: str,
+        user_id: str,
         request_id: str,
         model_name: str,
         start: float,
@@ -308,6 +315,7 @@ class DynamoProxy:
             if usage:
                 self._emit_usage(
                     org_id=org_id,
+                    user_id=user_id,
                     request_id=request_id,
                     model_name=model_name,
                     usage=usage,
@@ -323,6 +331,7 @@ class DynamoProxy:
         self,
         *,
         org_id: str,
+        user_id: str,
         request_id: str,
         model_name: str,
         usage: Dict[str, Any],
@@ -335,7 +344,7 @@ class DynamoProxy:
 
         properties: Dict[str, Any] = {
             "model_id": model_name,
-            "customer_id": org_id,
+            "user_id": user_id,
             "request_id": request_id,
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
@@ -352,8 +361,9 @@ class DynamoProxy:
             source=source,
         )
         logger.debug(
-            "FlexPrice usage enqueued: org=%s model=%s in=%s out=%s",
+            "FlexPrice usage enqueued: org=%s user=%s model=%s in=%s out=%s",
             org_id,
+            user_id,
             model_name,
             properties["input_tokens"],
             properties["output_tokens"],

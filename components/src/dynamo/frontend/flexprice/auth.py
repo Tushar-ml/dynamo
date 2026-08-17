@@ -26,8 +26,14 @@ class AuthError(Exception):
 class AuthCtx:
     """Decoded claims from a validated JWT."""
 
-    user_uuid: str
+    # The `uuid` claim — identifies the token's subject (e.g. a TeamMember
+    # record), not the actual user. Kept only because the claim is
+    # mandatory; use `user_uuid` for the real user identity.
+    subject_uuid: str
     org_uuid: str
+    # The `user_uuid` claim — the actual user id, used for billing
+    # attribution. Empty when the token doesn't carry it.
+    user_uuid: str = ""
     token_uuid: str = ""
 
 
@@ -129,10 +135,11 @@ def authenticate(
     token = parts[1].strip()
     claims = _verify_jwt(token, secret_keys)
 
-    user_uuid = claims.get("uuid")
+    subject_uuid = claims.get("uuid")
     org_uuid = claims.get("org_uuid")
+    user_uuid = claims.get("user_uuid")
 
-    if not user_uuid:
+    if not subject_uuid:
         raise AuthError("token is missing the 'uuid' claim")
     if not org_uuid:
         raise AuthError("token is missing the 'org_uuid' claim")
@@ -143,7 +150,8 @@ def authenticate(
         )
 
     return AuthCtx(
-        user_uuid=str(user_uuid),
+        subject_uuid=str(subject_uuid),
         org_uuid=str(org_uuid),
+        user_uuid=str(user_uuid) if user_uuid else "",
         token_uuid=str(claims.get("token_uuid", "")),
     )

@@ -37,12 +37,16 @@ from dynamo.frontend.flexprice.proxy import (
 
 _SECRET = "test-secret-key"
 _ORG_UUID = "org-abc-123"
+# The "uuid" claim — the token's subject (e.g. TeamMember uuid), not the
+# actual user. Kept distinct from _USER_UUID below to mirror production.
 _USER_UUID = "user-xyz-456"
+_SUBJECT_UUID = "subject-def-789"
 
 
 def _make_jwt(
     org_uuid: str = _ORG_UUID,
     user_uuid: str = _USER_UUID,
+    subject_uuid: str = _SUBJECT_UUID,
     exp_offset: int = 3600,
     secret: str = _SECRET,
     alg: str = "HS256",
@@ -55,7 +59,12 @@ def _make_jwt(
 
     header = b64({"alg": alg, "typ": "JWT"})
     payload = b64(
-        {"org_uuid": org_uuid, "uuid": user_uuid, "exp": int(time.time()) + exp_offset}
+        {
+            "org_uuid": org_uuid,
+            "uuid": subject_uuid,
+            "user_uuid": user_uuid,
+            "exp": int(time.time()) + exp_offset,
+        }
     )
     sig_input = f"{header}.{payload}".encode()
     sig = hmac.new(secret.encode(), sig_input, hash_fns[alg]).digest()
@@ -93,6 +102,7 @@ class TestAuthenticate:
         token = _make_jwt()
         ctx = authenticate(f"Bearer {token}", [_SECRET])
         assert ctx.org_uuid == _ORG_UUID
+        assert ctx.subject_uuid == _SUBJECT_UUID
         assert ctx.user_uuid == _USER_UUID
 
     def test_missing_header(self):
@@ -644,7 +654,7 @@ class TestDynamoProxy:
                 assert len(enqueued) == 1
                 assert enqueued[0]["external_customer_id"] == _ORG_UUID
                 assert enqueued[0]["properties"]["input_tokens"] == 10
-                assert enqueued[0]["properties"]["customer_id"] == _ORG_UUID
+                assert enqueued[0]["properties"]["user_id"] == _USER_UUID
                 assert enqueued[0]["properties"]["request_id"]
             finally:
                 await proxy_client.close()

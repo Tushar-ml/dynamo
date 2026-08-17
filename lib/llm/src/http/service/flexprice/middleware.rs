@@ -27,6 +27,12 @@ use crate::http::service::service_v2;
 #[derive(Debug, Clone)]
 pub struct OrgUuid(pub String);
 
+/// The JWT-verified user UUID (the `user_uuid` claim). Inserted alongside
+/// [`OrgUuid`] so billed handlers can attribute usage events to the actual
+/// user, not just the org. Same `None`-when-unauthenticated semantics.
+#[derive(Debug, Clone)]
+pub struct UserUuid(pub String);
+
 pub async fn auth_middleware(
     axum::extract::State(state): axum::extract::State<Arc<service_v2::State>>,
     mut request: Request,
@@ -76,5 +82,6 @@ pub async fn auth_middleware(
     // from client input, so there's no spoofing vector to guard against here
     // (unlike a header-based propagation scheme).
     request.extensions_mut().insert(OrgUuid(ctx.org_uuid));
+    request.extensions_mut().insert(UserUuid(ctx.user_uuid));
     next.run(request).await
 }

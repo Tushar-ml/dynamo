@@ -427,6 +427,7 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
 async fn handler_completions(
     State(state): State<Arc<service_v2::State>>,
     maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(mut request): Json<NvCreateCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
@@ -434,6 +435,7 @@ async fn handler_completions(
     check_ready(&state)?;
 
     let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
@@ -462,15 +464,16 @@ async fn handler_completions(
 
     // possibly long running task
     // if this returns a streaming response, the stream handle will be armed and captured by the response stream
-    let response =
-        tokio::spawn(completions(state, request, stream_handle, org_uuid).in_current_span())
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await chat completions task: {:?}",
-                    e,
-                ))
-            })?;
+    let response = tokio::spawn(
+        completions(state, request, stream_handle, org_uuid, user_uuid).in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        ErrorMessage::internal_server_error(&format!(
+            "Failed to await chat completions task: {:?}",
+            e,
+        ))
+    })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -485,6 +488,7 @@ async fn completions(
     request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
 
@@ -502,11 +506,11 @@ async fn completions(
 
     // If single prompt or single-element batch, use original flow
     if batch_size == 1 {
-        return completions_single(state, request, stream_handle, org_uuid).await;
+        return completions_single(state, request, stream_handle, org_uuid, user_uuid).await;
     }
 
     // Batch processing: handle multiple prompts
-    completions_batch(state, request, stream_handle, batch_size, n, org_uuid).await
+    completions_batch(state, request, stream_handle, batch_size, n, org_uuid, user_uuid).await
 }
 
 /// Handle single prompt completions (original logic)
@@ -516,6 +520,7 @@ async fn completions_single(
     mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
 
@@ -533,6 +538,7 @@ async fn completions_single(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        user_uuid.as_deref(),
         &request_id,
         &metric_model,
         streaming,
@@ -698,6 +704,7 @@ async fn completions_batch(
     batch_size: usize,
     n: u8,
     org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::extract_single_prompt;
     use futures::stream::{self, StreamExt};
@@ -714,6 +721,7 @@ async fn completions_batch(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        user_uuid.as_deref(),
         &request_id,
         &metric_model,
         streaming,
@@ -915,6 +923,7 @@ async fn completions_batch(
 async fn embeddings(
     State(state): State<Arc<service_v2::State>>,
     maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(request): Json<NvCreateEmbeddingRequest>,
 ) -> Result<Response, ErrorResponse> {
@@ -922,6 +931,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     let request_id = get_or_create_request_id(&headers);
     let request = Context::with_id(request, request_id);
@@ -941,6 +951,7 @@ async fn embeddings(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        user_uuid.as_deref(),
         &request_id,
         &metric_model,
         streaming,
@@ -1017,6 +1028,7 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(mut request): Json<NvCreateChatCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
@@ -1024,6 +1036,7 @@ async fn handler_chat_completions(
     check_ready(&state)?;
 
     let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
@@ -1049,7 +1062,8 @@ async fn handler_chat_completions(
     .await;
 
     let response = tokio::spawn(
-        chat_completions(state, template, request, stream_handle, org_uuid).in_current_span(),
+        chat_completions(state, template, request, stream_handle, org_uuid, user_uuid)
+            .in_current_span(),
     )
     .await
     .map_err(|e| {
@@ -1347,6 +1361,7 @@ async fn chat_completions(
     mut request: Context<NvCreateChatCompletionRequest>,
     mut stream_handle: ConnectionHandle,
     org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -1383,6 +1398,7 @@ async fn chat_completions(
         state.flexprice_client(),
         state.flexprice_config(),
         org_uuid.as_deref(),
+        user_uuid.as_deref(),
         &request_id,
         &metric_model,
         streaming,

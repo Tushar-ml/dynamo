@@ -23,6 +23,7 @@ use super::config::FlexPriceConfig;
 pub struct UsageBillingGuard {
     client: Option<Arc<FlexPriceClient>>,
     org_uuid: String,
+    user_uuid: String,
     request_id: String,
     event_name: String,
     source: String,
@@ -42,17 +43,20 @@ impl UsageBillingGuard {
         client: Option<Arc<FlexPriceClient>>,
         config: &FlexPriceConfig,
         org_uuid: Option<&str>,
+        user_uuid: Option<&str>,
         request_id: &str,
         model: &str,
         streaming: bool,
     ) -> Self {
         let org_uuid = org_uuid.unwrap_or_default().to_string();
+        let user_uuid = user_uuid.unwrap_or_default().to_string();
         let client = if org_uuid.is_empty() { None } else { client };
         Self {
             event_name: config.resolve_event_name(model),
             source: config.resolve_source_name(),
             client,
             org_uuid,
+            user_uuid,
             request_id: request_id.to_string(),
             model: model.to_string(),
             streaming,
@@ -108,7 +112,7 @@ impl Drop for UsageBillingGuard {
 
         let mut properties = BTreeMap::new();
         properties.insert("model_id".to_string(), self.model.clone());
-        properties.insert("customer_id".to_string(), self.org_uuid.clone());
+        properties.insert("user_id".to_string(), self.user_uuid.clone());
         properties.insert("request_id".to_string(), self.request_id.clone());
         properties.insert("input_tokens".to_string(), self.input_tokens.to_string());
         properties.insert("output_tokens".to_string(), self.output_tokens.to_string());
@@ -146,7 +150,9 @@ mod tests {
     #[test]
     fn no_op_when_client_is_none() {
         let config = FlexPriceConfig::default();
-        let mut guard = UsageBillingGuard::new(None, &config, Some("org-1"), "req-1", "model", false);
+        let mut guard = UsageBillingGuard::new(
+            None, &config, Some("org-1"), Some("user-1"), "req-1", "model", false,
+        );
         assert!(!guard.is_active());
         guard.record_usage(&usage(10, 5, 15));
         // Dropping must not panic even though there's no client to send to.
@@ -157,7 +163,9 @@ mod tests {
     async fn no_op_when_org_uuid_missing() {
         let client = FlexPriceClient::new("localhost:1", "key");
         let config = FlexPriceConfig::default();
-        let guard = UsageBillingGuard::new(Some(client), &config, None, "req-1", "model", false);
+        let guard = UsageBillingGuard::new(
+            Some(client), &config, None, Some("user-1"), "req-1", "model", false,
+        );
         assert!(!guard.is_active());
         // usage never recorded and org id absent — Drop must no-op safely.
         drop(guard);
@@ -167,14 +175,18 @@ mod tests {
     async fn is_active_when_client_and_org_uuid_present() {
         let client = FlexPriceClient::new("localhost:1", "key");
         let config = FlexPriceConfig::default();
-        let guard = UsageBillingGuard::new(Some(client), &config, Some("org-1"), "req-1", "model", true);
+        let guard = UsageBillingGuard::new(
+            Some(client), &config, Some("org-1"), Some("user-1"), "req-1", "model", true,
+        );
         assert!(guard.is_active());
     }
 
     #[test]
     fn accumulates_usage_across_multiple_records() {
         let config = FlexPriceConfig::default();
-        let mut guard = UsageBillingGuard::new(None, &config, Some("org-1"), "req-1", "model", true);
+        let mut guard = UsageBillingGuard::new(
+            None, &config, Some("org-1"), Some("user-1"), "req-1", "model", true,
+        );
         guard.record_usage(&usage(10, 5, 15));
         guard.record_usage(&usage(0, 3, 3));
         assert_eq!(guard.input_tokens, 10);
@@ -185,8 +197,11 @@ mod tests {
     #[test]
     fn stores_org_uuid_and_request_id_for_billing_properties() {
         let config = FlexPriceConfig::default();
-        let guard = UsageBillingGuard::new(None, &config, Some("org-1"), "req-42", "model", false);
+        let guard = UsageBillingGuard::new(
+            None, &config, Some("org-1"), Some("user-1"), "req-42", "model", false,
+        );
         assert_eq!(guard.org_uuid, "org-1");
+        assert_eq!(guard.user_uuid, "user-1");
         assert_eq!(guard.request_id, "req-42");
     }
 
@@ -194,7 +209,9 @@ mod tests {
     async fn drop_without_recorded_usage_is_a_no_op() {
         let client = FlexPriceClient::new("localhost:1", "key");
         let config = FlexPriceConfig::default();
-        let guard = UsageBillingGuard::new(Some(client), &config, Some("org-1"), "req-1", "model", false);
+        let guard = UsageBillingGuard::new(
+            Some(client), &config, Some("org-1"), Some("user-1"), "req-1", "model", false,
+        );
         // Cancelled/errored request: never called record_usage — must not panic.
         drop(guard);
     }
