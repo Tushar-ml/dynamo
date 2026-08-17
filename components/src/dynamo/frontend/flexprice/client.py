@@ -11,6 +11,13 @@ logger = logging.getLogger(__name__)
 _EVENTS_PATH = "/events"
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 _QUEUE_SIZE = 1000
+# Cap on in-flight POSTs so a burst of billed requests drains faster than
+# one-at-a-time (which would otherwise cap throughput at 1/RTT), without
+# spawning unbounded concurrent tasks.
+_MAX_CONCURRENT_SENDS = 20
+# Total attempts (including the first) before giving up on a single event.
+_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECS = 0.2
 
 
 class FlexPriceClient:
@@ -18,7 +25,16 @@ class FlexPriceClient:
 
     Enqueue is non-blocking — the caller returns immediately and the background
     worker drains the queue independently, so billing never adds latency to the
-    request path.
+    request path. The queue is bounded (``_QUEUE_SIZE``); an event is dropped
+    only when either:
+      - the queue is full, i.e. events are arriving faster than
+        ``_MAX_CONCURRENT_SENDS`` in-flight POSTs can drain them, or
+      - a single event's POST still fails after ``_MAX_ATTEMPTS`` retries with
+        backoff (persistent failure — the closest local proxy for "FlexPrice
+        is down" without a live health check).
+    A lone transient error (timeout, connection reset, one 5xx) does *not*
+    drop an event — it's retried — and draining up to ``_MAX_CONCURRENT_SENDS``
+    events concurrently means throughput isn't capped at one request-per-RTT.
     """
 
     def __init__(self, api_host: str, api_key: str) -> None:
@@ -32,6 +48,8 @@ class FlexPriceClient:
             maxsize=_QUEUE_SIZE
         )
         self._worker_task: Optional[asyncio.Task] = None
+        self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SENDS)
+        self._inflight: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession(
@@ -49,6 +67,10 @@ class FlexPriceClient:
                 await asyncio.wait_for(self._worker_task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._worker_task.cancel()
+        if self._inflight:
+            # Best-effort: give any sends still retrying a moment to finish
+            # rather than silently dropping them on shutdown.
+            await asyncio.wait(self._inflight, timeout=5.0)
         if self._session:
             await self._session.close()
 
@@ -78,19 +100,54 @@ class FlexPriceClient:
             )
 
     async def _worker(self) -> None:
+        """Drains the queue, dispatching up to ``_MAX_CONCURRENT_SENDS`` POSTs
+        at once so throughput isn't serialized behind one request-per-RTT.
+        Acquiring the semaphore (inside ``_send_with_retry``) means
+        backpressure happens off the request path — never a dropped event on
+        its own.
+        """
         while True:
             event = await self._queue.get()
             if event is None:
                 while not self._queue.empty():
                     item = self._queue.get_nowait()
                     if item is not None:
-                        await self._send(item)
+                        self._dispatch(item)
+                if self._inflight:
+                    await asyncio.gather(*self._inflight, return_exceptions=True)
                 break
-            await self._send(event)
+            self._dispatch(event)
 
-    async def _send(self, event: Dict[str, Any]) -> None:
+    def _dispatch(self, event: Dict[str, Any]) -> None:
+        task = asyncio.create_task(self._send_with_retry(event))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
+    async def _send_with_retry(self, event: Dict[str, Any]) -> None:
+        """Sends one event, retrying transient failures (network errors, 5xx)
+        with backoff. Only gives up — dropping the event — after
+        ``_MAX_ATTEMPTS`` consecutive failures.
+        """
+        async with self._semaphore:
+            for attempt in range(1, _MAX_ATTEMPTS + 1):
+                ok, detail = await self._send_once(event)
+                if ok:
+                    return
+                if attempt == _MAX_ATTEMPTS:
+                    logger.warning(
+                        "FlexPrice event %s dropped after %d attempts: %s",
+                        event.get("event_name"), attempt, detail,
+                    )
+                    return
+                logger.debug(
+                    "FlexPrice event %s send failed (attempt %d/%d): %s; retrying",
+                    event.get("event_name"), attempt, _MAX_ATTEMPTS, detail,
+                )
+                await asyncio.sleep(_RETRY_BASE_DELAY_SECS * attempt)
+
+    async def _send_once(self, event: Dict[str, Any]) -> "tuple[bool, str]":
         if not self._session:
-            return
+            return False, "no session"
         payload = {
             "event_name": event["event_name"],
             "external_customer_id": event["external_customer_id"],
@@ -103,10 +160,8 @@ class FlexPriceClient:
             async with self._session.post(
                 self._events_url, json=payload, timeout=_REQUEST_TIMEOUT
             ) as resp:
-                if resp.status < 200 or resp.status >= 300:
-                    logger.warning(
-                        "FlexPrice API returned %d for event %s",
-                        resp.status, event.get("event_name"),
-                    )
+                if 200 <= resp.status < 300:
+                    return True, ""
+                return False, f"status={resp.status}"
         except Exception as exc:
-            logger.warning("Failed to emit FlexPrice event: %s", exc)
+            return False, str(exc)

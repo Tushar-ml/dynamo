@@ -24,7 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from dynamo.frontend.flexprice.auth import AuthCtx, AuthError, authenticate
-from dynamo.frontend.flexprice.client import FlexPriceClient
+from dynamo.frontend.flexprice.client import _MAX_ATTEMPTS, FlexPriceClient
 from dynamo.frontend.flexprice.config import FlexPriceConfig
 from dynamo.frontend.flexprice.proxy import (
     DynamoProxy,
@@ -294,6 +294,52 @@ class TestFlexPriceClient:
 
         await client.stop()
         assert len(sent) == 5
+
+    async def test_transient_failure_is_retried_not_dropped(self):
+        """A couple of transient errors must not drop the event — it's retried."""
+        attempts: list = []
+
+        def fake_post(_url, json=None, **_kwargs):
+            attempts.append(json)
+            resp = MagicMock()
+            resp.status = 500 if len(attempts) < 3 else 200
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        client = FlexPriceClient(api_host="api.flexprice.io", api_key="key")
+        await client.start()
+        client._session.post = fake_post  # type: ignore[union-attr]
+
+        await client._send_with_retry(
+            {"event_name": "ev", "external_customer_id": _ORG_UUID, "properties": {}}
+        )
+        await client.stop()
+
+        assert len(attempts) == 3
+
+    async def test_gives_up_after_max_attempts(self):
+        """A persistent failure must be dropped only after every attempt is exhausted."""
+        attempts: list = []
+
+        def fake_post(_url, json=None, **_kwargs):
+            attempts.append(json)
+            resp = MagicMock()
+            resp.status = 500
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        client = FlexPriceClient(api_host="api.flexprice.io", api_key="key")
+        await client.start()
+        client._session.post = fake_post  # type: ignore[union-attr]
+
+        await client._send_with_retry(
+            {"event_name": "ev", "external_customer_id": _ORG_UUID, "properties": {}}
+        )
+        await client.stop()
+
+        assert len(attempts) == _MAX_ATTEMPTS
 
 
 # Utility function tests
