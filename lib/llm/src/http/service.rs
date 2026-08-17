@@ -25,6 +25,7 @@ mod relay_metrics;
 pub mod busy_threshold;
 pub mod disconnect;
 pub mod error;
+pub mod flexprice;
 pub mod health;
 pub mod metrics;
 pub mod openapi_docs;
