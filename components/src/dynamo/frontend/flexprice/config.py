@@ -13,9 +13,11 @@ class FlexPriceConfig:
     come from the authenticated JWT.
 
     Auth env vars (required to activate the proxy):
-        DYN_AUTH_ENABLED    - Enable JWT authentication (default: false)
-        DYN_AUTH_SECRET_KEY - HMAC secret(s) for JWT validation, comma-separated for key rotation
-        DYN_AUTH_VALID_ORGS - Comma-separated org UUID allowlist; empty = allow all authenticated orgs
+        DYN_AUTH_ENABLED      - Enable JWT authentication (default: false)
+        DYN_AUTH_SECRET_KEY   - HMAC secret(s) for JWT validation, comma-separated for key rotation
+        DYN_AUTH_VALID_ORGS   - Comma-separated org UUID allowlist; empty = allow all authenticated orgs
+        DYN_AUTH_EXEMPT_PATHS - Comma-separated paths served without auth (default: "/metrics,/health,/healthz"),
+                                for Prometheus/Alloy scraping and k8s liveness probes
 
     FlexPrice env vars (optional; requires auth):
         DYN_FLEXPRICE_ENABLED              - Enable async usage event emission (default: false)
@@ -30,6 +32,7 @@ class FlexPriceConfig:
     auth_enabled: bool
     auth_secret_keys: List[str]
     auth_valid_orgs: List[str]
+    auth_exempt_paths: frozenset
 
     # FlexPrice billing (optional; requires auth)
     enabled: bool
@@ -54,10 +57,18 @@ class FlexPriceConfig:
         raw_orgs = os.environ.get("DYN_AUTH_VALID_ORGS", "")
         auth_valid_orgs = [o.strip() for o in raw_orgs.split(",") if o.strip()]
 
+        raw_exempt = os.environ.get(
+            "DYN_AUTH_EXEMPT_PATHS", "/metrics,/health,/healthz"
+        )
+        auth_exempt_paths = frozenset(
+            p.strip() for p in raw_exempt.split(",") if p.strip()
+        )
+
         return cls(
             auth_enabled=auth_enabled,
             auth_secret_keys=auth_secret_keys,
             auth_valid_orgs=auth_valid_orgs,
+            auth_exempt_paths=auth_exempt_paths,
             enabled=enabled,
             api_key=os.environ.get("DYN_FLEXPRICE_API_KEY", ""),
             api_host=os.environ.get("DYN_FLEXPRICE_API_HOST", "").rstrip("/"),

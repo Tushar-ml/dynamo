@@ -67,11 +67,17 @@ def _make_config(
     flexprice_enabled: bool = False,
     secret: str = _SECRET,
     valid_orgs: Optional[list] = None,
+    exempt_paths: Optional[frozenset] = None,
 ) -> FlexPriceConfig:
     return FlexPriceConfig(
         auth_enabled=auth_enabled,
         auth_secret_keys=[secret],
         auth_valid_orgs=valid_orgs or [],
+        auth_exempt_paths=(
+            exempt_paths
+            if exempt_paths is not None
+            else frozenset({"/metrics", "/health", "/healthz"})
+        ),
         enabled=flexprice_enabled,
         api_key="fp-key" if flexprice_enabled else "",
         api_host="api.flexprice.io" if flexprice_enabled else "",
@@ -169,12 +175,19 @@ class TestFlexPriceConfig:
         for key in [
             "DYN_AUTH_ENABLED", "DYN_FLEXPRICE_ENABLED", "DYN_AUTH_SECRET_KEY",
             "DYN_AUTH_VALID_ORGS", "DYN_FLEXPRICE_API_KEY", "DYN_FLEXPRICE_API_HOST",
+            "DYN_AUTH_EXEMPT_PATHS",
         ]:
             monkeypatch.delenv(key, raising=False)
         cfg = FlexPriceConfig.from_env()
         assert cfg.auth_enabled is False
         assert cfg.enabled is False
         assert cfg.auth_secret_keys == []
+        assert cfg.auth_exempt_paths == frozenset({"/metrics", "/health", "/healthz"})
+
+    def test_from_env_custom_exempt_paths(self, monkeypatch):
+        monkeypatch.setenv("DYN_AUTH_EXEMPT_PATHS", "/metrics, /ping")
+        cfg = FlexPriceConfig.from_env()
+        assert cfg.auth_exempt_paths == frozenset({"/metrics", "/ping"})
 
     def test_from_env_auth_only(self, monkeypatch):
         monkeypatch.setenv("DYN_AUTH_ENABLED", "true")
@@ -464,6 +477,53 @@ class TestDynamoProxy:
                 assert resp.status == 401
                 body = await resp.json()
                 assert body["statusCode"] == 401
+            finally:
+                await client.close()
+        finally:
+            await backend.close()
+
+    async def test_exempt_path_skips_auth(self):
+        """GET /metrics without a token must bypass auth and forward to the backend."""
+        backend = await _make_mock_backend({"ok": True})
+        try:
+            client = await self._make_proxy_client(backend)
+            try:
+                resp = await client.get("/metrics")
+                assert resp.status == 200
+            finally:
+                await client.close()
+        finally:
+            await backend.close()
+
+    async def test_exempt_path_not_metered(self):
+        """/metrics must never trigger FlexPrice emission, even if reachable without auth."""
+        backend = await _make_mock_backend({"ok": True})
+        try:
+            enqueued: list = []
+            fp_client = MagicMock(spec=FlexPriceClient)
+            fp_client.enqueue = lambda **kwargs: enqueued.append(kwargs)
+
+            cfg = _make_config(flexprice_enabled=True)
+            proxy_client = await self._make_proxy_client(
+                backend, config=cfg, flexprice_client=fp_client
+            )
+            try:
+                resp = await proxy_client.get("/metrics")
+                assert resp.status == 200
+                assert enqueued == []
+            finally:
+                await proxy_client.close()
+        finally:
+            await backend.close()
+
+    async def test_non_exempt_path_still_requires_auth(self):
+        """Exemption is scoped to configured paths only — other routes stay protected."""
+        backend = await _make_mock_backend({})
+        try:
+            client = await self._make_proxy_client(backend)
+            try:
+                resp = await client.get("/v1/models")
+                assert resp.status == 401
             finally:
                 await client.close()
         finally:
