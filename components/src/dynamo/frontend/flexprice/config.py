@@ -24,6 +24,9 @@ class FlexPriceConfig:
         DYN_FLEXPRICE_EVENT_NAME           - Override billing event name (default: "{model}-llm-usage")
         DYN_FLEXPRICE_SOURCE_NAME          - Override billing source name (default: "{deployment_name}_{deployment_id}")
         DYN_FLEXPRICE_INTERNAL_PORT_OFFSET - Port offset for the internal Dynamo HTTP service (default: 1)
+        DYN_FLEXPRICE_QUEUE_SIZE           - Max pending usage events buffered by FlexPriceClient
+                                              before new events are dropped (default: 4500). Read
+                                              directly by FlexPriceClient, not part of this dataclass.
         DYN_FLEXPRICE_MINIMUM_BALANCE      - Minimum wallet balance required for a prepaid org to be
                                               allowed through (default: 0.0, i.e. block once negative).
                                               Postpaid orgs bypass this check entirely.

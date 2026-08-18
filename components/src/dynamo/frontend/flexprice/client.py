@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -10,7 +11,9 @@ logger = logging.getLogger(__name__)
 
 _EVENTS_PATH = "/events"
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
-_QUEUE_SIZE = 1200
+# Bound on the pending-events queue (see class docstring); overridable via
+# env for deployments that see burstier traffic than the default anticipates.
+_QUEUE_SIZE = int(os.environ.get("DYN_FLEXPRICE_QUEUE_SIZE", "4500"))
 # Cap on in-flight POSTs so a burst of billed requests drains faster than
 # one-at-a-time (which would otherwise cap throughput at 1/RTT), without
 # spawning unbounded concurrent tasks.
