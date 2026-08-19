@@ -253,8 +253,10 @@ async def async_main():
     router_config = RouterConfig(
         router_mode, kv_router_config, **config.router_kwargs()
     )
-    # When the proxy is required (auth or billing enabled), the Rust service
-    # binds to an internal loopback port and the Python proxy sits in front.
+    # Auth/billing default to the native Rust path (it reads the same env
+    # vars directly, in this same process) — Rust binds the public port and
+    # this Python proxy is never started. The proxy only fronts Dynamo when
+    # DYN_FLEXPRICE_USE_PROXY is explicitly set (see FlexPriceConfig.proxy_required).
     user_http_host = config.http_host
     user_http_port = config.http_port
     if flexprice_cfg.proxy_required:
@@ -270,6 +272,15 @@ async def async_main():
         )
     else:
         internal_port = user_http_port
+        if flexprice_cfg.auth_enabled:
+            logger.info(
+                "Native Rust auth+billing enabled (auth=%s billing=%s); "
+                "Dynamo HTTP service binds %s:%d directly (no Python proxy)",
+                flexprice_cfg.auth_enabled,
+                flexprice_cfg.enabled,
+                user_http_host,
+                user_http_port,
+            )
 
     kwargs: dict[str, Any] = {
         "http_host": "127.0.0.1" if flexprice_cfg.proxy_required else config.http_host,

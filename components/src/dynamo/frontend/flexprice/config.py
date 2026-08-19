@@ -7,15 +7,25 @@ from typing import List
 class FlexPriceConfig:
     """Configuration for the auth + FlexPrice billing layer.
 
-    The proxy activates only when DYN_AUTH_ENABLED=true.  FlexPrice usage
-    emission is optional on top — it requires DYN_FLEXPRICE_ENABLED=true,
-    which in turn requires DYN_AUTH_ENABLED=true because the org UUID must
-    come from the authenticated JWT.
+    Auth and billing are handled natively by the Rust Dynamo HTTP service
+    itself (lib/llm/src/http/service/flexprice/) whenever DYN_AUTH_ENABLED=true
+    — it reads the same env vars this dataclass does, since it's embedded in
+    this same process. By default that's the *only* thing that runs: Rust
+    binds the public port directly, so this Python auth proxy is not started
+    at all.
 
-    Auth env vars (required to activate the proxy):
+    The proxy exists purely as an opt-in fallback (DYN_FLEXPRICE_USE_PROXY=true)
+    for the case where the native Rust path needs to be bypassed. Running both
+    at once double-authenticates and double-bills every request — that's a bug,
+    not a supported configuration — so leave DYN_FLEXPRICE_USE_PROXY unset
+    unless you have a specific reason to route through this proxy instead.
+
+    Auth env vars (required to activate either path):
         DYN_AUTH_ENABLED    - Enable JWT authentication (default: false)
         DYN_AUTH_SECRET_KEY - HMAC secret(s) for JWT validation, comma-separated for key rotation
         DYN_AUTH_VALID_ORGS - Comma-separated org UUID allowlist; empty = allow all authenticated orgs
+        DYN_FLEXPRICE_USE_PROXY - Opt into this Python proxy fronting Rust instead of Rust
+                                  binding the public port directly (default: false)
 
     FlexPrice env vars (optional; requires auth):
         DYN_FLEXPRICE_ENABLED              - Enable async usage event emission (default: false)
@@ -36,10 +46,12 @@ class FlexPriceConfig:
                                               source (default: "local")
     """
 
-    # Auth (master switch for the proxy)
+    # Auth (master switch for the native Rust auth+billing path)
     auth_enabled: bool
     auth_secret_keys: List[str]
     auth_valid_orgs: List[str]
+    # Opt-in: front Rust with this Python proxy instead of binding directly.
+    use_proxy: bool
 
     # FlexPrice billing (optional; requires auth)
     enabled: bool
@@ -60,6 +72,9 @@ class FlexPriceConfig:
         enabled = os.environ.get("DYN_FLEXPRICE_ENABLED", "false").lower() in (
             "true", "1", "yes",
         )
+        use_proxy = os.environ.get("DYN_FLEXPRICE_USE_PROXY", "false").lower() in (
+            "true", "1", "yes",
+        )
 
         raw_keys = os.environ.get("DYN_AUTH_SECRET_KEY", "")
         auth_secret_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
@@ -71,6 +86,7 @@ class FlexPriceConfig:
             auth_enabled=auth_enabled,
             auth_secret_keys=auth_secret_keys,
             auth_valid_orgs=auth_valid_orgs,
+            use_proxy=use_proxy,
             enabled=enabled,
             api_key=os.environ.get("DYN_FLEXPRICE_API_KEY", ""),
             api_host=os.environ.get("DYN_FLEXPRICE_API_HOST", "").rstrip("/"),
@@ -110,8 +126,16 @@ class FlexPriceConfig:
 
     @property
     def proxy_required(self) -> bool:
-        """True when the Python proxy layer must be inserted in front of Dynamo."""
-        return self.auth_enabled
+        """True when the Python proxy layer must be inserted in front of Dynamo.
+
+        Default is False even with auth enabled — the native Rust auth+billing
+        path (lib/llm/src/http/service/flexprice/) handles it directly, since
+        it reads the same env vars from this same process. This only becomes
+        True when DYN_FLEXPRICE_USE_PROXY is explicitly set, as an opt-in
+        fallback. Running both at once double-authenticates and double-bills
+        every request, so this is deliberately not the default.
+        """
+        return self.auth_enabled and self.use_proxy
 
     def resolve_event_name(self, model_name: str = "") -> str:
         if self.event_name:

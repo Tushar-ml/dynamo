@@ -78,11 +78,17 @@ def _make_config(
     flexprice_enabled: bool = False,
     secret: str = _SECRET,
     valid_orgs: Optional[list] = None,
+    use_proxy: bool = True,
 ) -> FlexPriceConfig:
+    # Tests exercise DynamoProxy directly regardless of `use_proxy` — that
+    # flag only affects whether main.py *spawns* this proxy in real
+    # deployments. Defaults to True here so existing tests that construct a
+    # working proxy don't need to opt in explicitly.
     return FlexPriceConfig(
         auth_enabled=auth_enabled,
         auth_secret_keys=[secret],
         auth_valid_orgs=valid_orgs or [],
+        use_proxy=use_proxy,
         enabled=flexprice_enabled,
         api_key="fp-key" if flexprice_enabled else "",
         api_host="api.flexprice.io" if flexprice_enabled else "",
@@ -210,6 +216,22 @@ class TestFlexPriceConfig:
         assert cfg.enabled is True
         assert cfg.api_host == "api.flexprice.io"
 
+    def test_from_env_use_proxy_defaults_false(self, monkeypatch):
+        monkeypatch.setenv("DYN_AUTH_ENABLED", "true")
+        monkeypatch.setenv("DYN_AUTH_SECRET_KEY", "secret")
+        monkeypatch.delenv("DYN_FLEXPRICE_USE_PROXY", raising=False)
+        cfg = FlexPriceConfig.from_env()
+        assert cfg.use_proxy is False
+        assert cfg.proxy_required is False
+
+    def test_from_env_use_proxy_explicit_opt_in(self, monkeypatch):
+        monkeypatch.setenv("DYN_AUTH_ENABLED", "true")
+        monkeypatch.setenv("DYN_AUTH_SECRET_KEY", "secret")
+        monkeypatch.setenv("DYN_FLEXPRICE_USE_PROXY", "true")
+        cfg = FlexPriceConfig.from_env()
+        assert cfg.use_proxy is True
+        assert cfg.proxy_required is True
+
     def test_validate_flexprice_without_auth_raises(self):
         cfg = _make_config(auth_enabled=False, flexprice_enabled=True)
         cfg.auth_secret_keys = []
@@ -228,9 +250,15 @@ class TestFlexPriceConfig:
         with pytest.raises(ValueError, match="DYN_FLEXPRICE_API_KEY"):
             cfg.validate()
 
-    def test_proxy_required_reflects_auth(self):
-        assert _make_config(auth_enabled=True).proxy_required is True
-        assert _make_config(auth_enabled=False).proxy_required is False
+    def test_proxy_required_defaults_to_false_even_with_auth_enabled(self):
+        # Native Rust auth+billing is the default path — the Python proxy
+        # only fronts Dynamo when explicitly opted into.
+        assert _make_config(auth_enabled=True, use_proxy=False).proxy_required is False
+        assert _make_config(auth_enabled=False, use_proxy=False).proxy_required is False
+
+    def test_proxy_required_true_only_when_both_auth_and_use_proxy_set(self):
+        assert _make_config(auth_enabled=True, use_proxy=True).proxy_required is True
+        assert _make_config(auth_enabled=False, use_proxy=True).proxy_required is False
 
     def test_resolve_event_name_default(self):
         cfg = _make_config()
