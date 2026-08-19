@@ -30,6 +30,7 @@ from dynamo.frontend.flexprice.config import FlexPriceConfig
 from dynamo.frontend.flexprice.proxy import (
     DynamoProxy,
     _extract_usage_from_json,
+    _get_client_max_size,
     _parse_usage_from_sse,
 )
 
@@ -534,6 +535,18 @@ class TestUtilityFunctions:
         result = _parse_usage_from_sse(data, current)
         assert result["completion_tokens"] == 15  # merged/summed
         assert result["prompt_tokens"] == 5
+
+    def test_client_max_size_defaults_to_45mb(self, monkeypatch):
+        monkeypatch.delenv("DYN_HTTP_BODY_LIMIT_MB", raising=False)
+        assert _get_client_max_size() == 45 * 1024 * 1024
+
+    def test_client_max_size_honors_env_override(self, monkeypatch):
+        monkeypatch.setenv("DYN_HTTP_BODY_LIMIT_MB", "100")
+        assert _get_client_max_size() == 100 * 1024 * 1024
+
+    def test_client_max_size_falls_back_on_invalid_env(self, monkeypatch):
+        monkeypatch.setenv("DYN_HTTP_BODY_LIMIT_MB", "not-a-number")
+        assert _get_client_max_size() == 45 * 1024 * 1024
 
     def test_parse_usage_from_sse_no_usage(self):
         data = json.dumps({"choices": []})

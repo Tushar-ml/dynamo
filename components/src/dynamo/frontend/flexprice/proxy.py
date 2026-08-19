@@ -24,6 +24,7 @@ balance check in front of it.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -64,6 +65,28 @@ _HOP_BY_HOP = frozenset(
 )
 
 _JSON_CT = "application/json"
+
+# aiohttp's own default request-body cap is 1MB (client_max_size), far below
+# what real chat/completions/embeddings payloads need. Mirrors the Rust
+# service's DYN_HTTP_BODY_LIMIT_MB (default 45MB, see openai.rs::get_body_limit)
+# so this proxy never rejects a request the backend would otherwise accept.
+_DEFAULT_BODY_LIMIT_MB = 45
+
+
+def _get_client_max_size() -> int:
+    mb = _DEFAULT_BODY_LIMIT_MB
+    raw = os.environ.get("DYN_HTTP_BODY_LIMIT_MB")
+    if raw:
+        try:
+            mb = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid DYN_HTTP_BODY_LIMIT_MB=%r; using default of %dMB",
+                raw,
+                _DEFAULT_BODY_LIMIT_MB,
+            )
+    return mb * 1024 * 1024
+
 
 # Mirrors the Rust service's header priority (see `get_or_create_request_id`
 # in openai.rs) so a request_id captured here lines up with the one the
@@ -450,7 +473,7 @@ async def run_proxy(
     )
     await proxy.start()
 
-    app = web.Application()
+    app = web.Application(client_max_size=_get_client_max_size())
     app.router.add_route("*", "/{path_info:.*}", proxy.handle)
 
     runner = web.AppRunner(app)
