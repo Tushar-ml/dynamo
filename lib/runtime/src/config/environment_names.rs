@@ -330,6 +330,10 @@ pub mod llm {
     /// always allowed regardless of balance. (default: "0")
     pub const DYN_FLEXPRICE_MINIMUM_BALANCE: &str = "DYN_FLEXPRICE_MINIMUM_BALANCE";
 
+    /// Max pending usage events buffered by FlexPriceClient before new events
+    /// are dropped (default: 4500).
+    pub const DYN_FLEXPRICE_QUEUE_SIZE: &str = "DYN_FLEXPRICE_QUEUE_SIZE";
+
     /// Backend stream inactivity timeout in seconds.
     ///
     /// When set to a positive integer, the frontend will kill the engine context

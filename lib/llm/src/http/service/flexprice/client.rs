@@ -6,8 +6,8 @@
 //! `enqueue` is non-blocking — the caller returns immediately and a background
 //! worker drains the queue independently, so billing never adds latency to
 //! the request path (enqueue is a plain channel push; it never awaits network
-//! I/O). The queue is bounded (`QUEUE_SIZE`); events are only dropped when
-//! either:
+//! I/O). The queue is bounded (default 4500, override via
+//! `DYN_FLEXPRICE_QUEUE_SIZE`); events are only dropped when either:
 //!   - the queue is full, i.e. events are arriving faster than
 //!     `MAX_CONCURRENT_SENDS` in-flight POSTs can drain them, or
 //!   - a single event's POST still fails after `MAX_ATTEMPTS` retries with
@@ -22,13 +22,23 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynamo_runtime::config::environment_names::llm as env_llm;
 use reqwest::Client;
 use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc};
 
 const EVENTS_PATH: &str = "/events";
-const QUEUE_SIZE: usize = 1200;
+const DEFAULT_QUEUE_SIZE: usize = 4500;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max pending usage events buffered before new events are dropped.
+/// Overridable via `DYN_FLEXPRICE_QUEUE_SIZE`.
+fn queue_size() -> usize {
+    std::env::var(env_llm::DYN_FLEXPRICE_QUEUE_SIZE)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUEUE_SIZE)
+}
 /// Cap on in-flight POSTs so a burst of billed requests drains faster than
 /// one-at-a-time (which would otherwise cap throughput at 1/RTT), without
 /// spawning unbounded concurrent tasks.
@@ -61,7 +71,7 @@ impl FlexPriceClient {
             .build()
             .expect("failed to build FlexPrice HTTP client");
 
-        let (tx, rx) = mpsc::channel::<UsageEvent>(QUEUE_SIZE);
+        let (tx, rx) = mpsc::channel::<UsageEvent>(queue_size());
         tokio::spawn(Self::worker(client, events_url, api_key, rx));
 
         Arc::new(Self { tx })

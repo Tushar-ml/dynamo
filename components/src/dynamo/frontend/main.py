@@ -41,7 +41,6 @@ from dynamo.llm import (
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 
-from .flexprice import FlexPriceConfig, run_proxy
 from .frontend_args import FrontendArgGroup, FrontendConfig
 
 if TYPE_CHECKING:
@@ -169,11 +168,10 @@ async def async_main():
     Initializes the distributed runtime, configures routing, and starts
     the HTTP server or interactive mode based on command-line arguments.
 
-    When DYN_FLEXPRICE_ENABLED=true the Dynamo Rust HTTP service is started
-    on an internal port (user port + DYN_FLEXPRICE_INTERNAL_PORT_OFFSET,
-    default 1) bound to 127.0.0.1, and a lightweight aiohttp reverse proxy
-    is started on the original user-facing host/port.  The proxy extracts
-    token usage from LLM responses and emits billing events to FlexPrice.
+    Auth and FlexPrice billing (DYN_AUTH_ENABLED / DYN_FLEXPRICE_ENABLED) are
+    handled natively by the Rust Dynamo HTTP service itself
+    (lib/llm/src/http/service/flexprice/) — it reads those env vars directly
+    from this same process, so no separate proxy or port-split is needed here.
     """
     # The system status server port is a worker concern.
     #
@@ -184,8 +182,6 @@ async def async_main():
     os.environ.pop("DYN_SYSTEM_PORT", None)
     config, vllm_flags, sglang_flags = parse_args()
 
-    flexprice_cfg = FlexPriceConfig.from_env()
-    flexprice_cfg.validate()
     dump_config(config.dump_config_to, config)
     if config.event_plane:
         os.environ["DYN_EVENT_PLANE"] = config.event_plane
@@ -253,38 +249,9 @@ async def async_main():
     router_config = RouterConfig(
         router_mode, kv_router_config, **config.router_kwargs()
     )
-    # Auth/billing default to the native Rust path (it reads the same env
-    # vars directly, in this same process) — Rust binds the public port and
-    # this Python proxy is never started. The proxy only fronts Dynamo when
-    # DYN_FLEXPRICE_USE_PROXY is explicitly set (see FlexPriceConfig.proxy_required).
-    user_http_host = config.http_host
-    user_http_port = config.http_port
-    if flexprice_cfg.proxy_required:
-        internal_port = user_http_port + flexprice_cfg.internal_port_offset
-        logger.info(
-            "FlexPrice proxy enabled (auth=%s billing=%s): "
-            "Dynamo HTTP service on 127.0.0.1:%d; proxy on %s:%d",
-            flexprice_cfg.auth_enabled,
-            flexprice_cfg.enabled,
-            internal_port,
-            user_http_host,
-            user_http_port,
-        )
-    else:
-        internal_port = user_http_port
-        if flexprice_cfg.auth_enabled:
-            logger.info(
-                "Native Rust auth+billing enabled (auth=%s billing=%s); "
-                "Dynamo HTTP service binds %s:%d directly (no Python proxy)",
-                flexprice_cfg.auth_enabled,
-                flexprice_cfg.enabled,
-                user_http_host,
-                user_http_port,
-            )
-
     kwargs: dict[str, Any] = {
-        "http_host": "127.0.0.1" if flexprice_cfg.proxy_required else config.http_host,
-        "http_port": internal_port,
+        "http_host": config.http_host,
+        "http_port": config.http_port,
         "kv_cache_block_size": config.kv_cache_block_size,
         "router_config": router_config,
         "migration_limit": config.migration_limit,
@@ -350,26 +317,6 @@ async def async_main():
             await run_input(runtime, "text", engine)
         elif config.kserve_grpc_server:
             await run_input(runtime, "grpc", engine)
-        elif flexprice_cfg.proxy_required:
-            backend_url = f"http://127.0.0.1:{internal_port}"
-            proxy_task = asyncio.create_task(
-                run_proxy(
-                    host=user_http_host,
-                    port=user_http_port,
-                    backend_url=backend_url,
-                    config=flexprice_cfg,
-                    model_name=config.model_name or "",
-                ),
-                name="flexprice-proxy",
-            )
-            try:
-                await asyncio.gather(
-                    run_input(runtime, "http", engine),
-                    proxy_task,
-                    return_exceptions=True,
-                )
-            finally:
-                proxy_task.cancel()
         else:
             await run_input(runtime, "http", engine)
     except asyncio.exceptions.CancelledError:
