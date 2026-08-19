@@ -148,6 +148,9 @@ class DynamoProxy:
             # Wallet balance gate: prepaid orgs below the configured minimum
             # balance (negative by default) are blocked; postpaid orgs bypass
             # this entirely. Only runs when FlexPrice billing is enabled.
+            # check() never awaits a live FlexPrice call (see balance.py) —
+            # it's cache-only-or-fail-open, so this never adds network
+            # latency before the request is forwarded.
             if self._balance_checker:
                 status = await self._balance_checker.check(org_id)
                 if status is BalanceStatus.SUSPENDED:

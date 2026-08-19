@@ -381,19 +381,47 @@ class TestBalanceChecker:
 
         return fake_get
 
+    async def _wait_for_cached(self, checker, org_uuid, timeout=5.0):
+        """Polls the cache until the background refresh lands, or raises —
+        deterministic without reaching into asyncio scheduling internals."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            cached = checker._cache.get(org_uuid)
+            if cached is not None:
+                return cached[0]
+            await asyncio.sleep(0.001)
+        raise AssertionError("background refresh never populated the cache")
+
+    async def test_cold_cache_fails_open_immediately_regardless_of_real_balance(self):
+        # Balance here is negative and would normally block — but on a cold
+        # cache, check() must fail open for *this* call without waiting on
+        # the fetch, which is the whole point of the redesign.
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = self._fake_get(200, [{"balance": "-1.00", "metadata": {}}])
+        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
     async def test_postpaid_org_is_allowed_with_negative_balance(self):
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = self._fake_get(
             200, [{"balance": "-50.00", "metadata": {"isKYC": "true"}}]
         )
-        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.check(_ORG_UUID)  # trigger background refresh
+        assert await self._wait_for_cached(checker, _ORG_UUID) is BalanceStatus.OK
         await checker.stop()
 
-    async def test_prepaid_org_with_negative_balance_is_blocked(self):
+    async def test_prepaid_org_with_negative_balance_is_blocked_once_cache_populates(self):
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = self._fake_get(200, [{"balance": "-1.00", "metadata": {}}])
+        await checker.check(_ORG_UUID)  # trigger background refresh
+        assert (
+            await self._wait_for_cached(checker, _ORG_UUID)
+            is BalanceStatus.INSUFFICIENT_BALANCE
+        )
+        # Now that the cache is warm, the gate actually takes effect.
         assert await checker.check(_ORG_UUID) is BalanceStatus.INSUFFICIENT_BALANCE
         await checker.stop()
 
@@ -401,10 +429,11 @@ class TestBalanceChecker:
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = self._fake_get(200, [{"balance": "10.00", "metadata": {}}])
-        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.check(_ORG_UUID)
+        assert await self._wait_for_cached(checker, _ORG_UUID) is BalanceStatus.OK
         await checker.stop()
 
-    async def test_suspended_org_is_blocked_even_if_postpaid(self):
+    async def test_suspended_org_is_blocked_once_cache_populates(self):
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = self._fake_get(
@@ -416,14 +445,16 @@ class TestBalanceChecker:
                 }
             ],
         )
-        assert await checker.check(_ORG_UUID) is BalanceStatus.SUSPENDED
+        await checker.check(_ORG_UUID)
+        assert await self._wait_for_cached(checker, _ORG_UUID) is BalanceStatus.SUSPENDED
         await checker.stop()
 
     async def test_flexprice_api_error_fails_open(self):
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = self._fake_get(500, [])
-        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.check(_ORG_UUID)
+        assert await self._wait_for_cached(checker, _ORG_UUID) is BalanceStatus.OK
         await checker.stop()
 
     async def test_result_is_cached_and_not_refetched(self):
@@ -441,8 +472,35 @@ class TestBalanceChecker:
         checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
         await checker.start()
         checker._session.get = fake_get
+        await checker.check(_ORG_UUID)
+        await self._wait_for_cached(checker, _ORG_UUID)
         assert await checker.check(_ORG_UUID) is BalanceStatus.OK
-        assert await checker.check(_ORG_UUID) is BalanceStatus.OK
+        await checker.stop()
+
+        assert len(calls) == 1
+
+    async def test_concurrent_misses_for_the_same_org_dedupe_to_one_fetch(self):
+        calls: list = []
+
+        def fake_get(_url, **_kwargs):
+            calls.append(1)
+            resp = MagicMock()
+            resp.status = 200
+            resp.json = AsyncMock(return_value=[{"balance": "10.00", "metadata": {}}])
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        checker = BalanceChecker(api_host="api.flexprice.io", api_key="key", minimum_balance=0.0)
+        await checker.start()
+        checker._session.get = fake_get
+
+        results = await asyncio.gather(
+            checker.check(_ORG_UUID), checker.check(_ORG_UUID), checker.check(_ORG_UUID)
+        )
+        # All three fail open immediately — none of them waited on the fetch.
+        assert results == [BalanceStatus.OK, BalanceStatus.OK, BalanceStatus.OK]
+        await self._wait_for_cached(checker, _ORG_UUID)
         await checker.stop()
 
         assert len(calls) == 1

@@ -9,11 +9,20 @@ orgs are blocked once their wallet balance drops below
 Results are cached in-process for ``_CACHE_TTL_SECS`` so a burst of requests
 from the same org doesn't hit FlexPrice's wallet API once per request —
 go-proxy uses a shared Redis cache for the same purpose across replicas; this
-proxy has no Redis dependency, so this is a per-process equivalent. Any
-FlexPrice API error fails open (allows the request) — a billing provider
-outage must never itself drop inference traffic.
+proxy has no Redis dependency, so this is a per-process equivalent.
+
+``check()`` never awaits a live FlexPrice call. On a cache hit it returns
+immediately; on a miss (cold cache or expired entry) it fails open for *that*
+call — same as an API error — and kicks off a deduped background refresh so
+the next request for that org sees the real cached status. This sits in the
+request's hot path (before the request is even forwarded to the backend), so
+a live network round trip to FlexPrice inline here would add that latency to
+every request whose cache entry is cold or has just expired. A billing
+provider outage or a slow wallet endpoint must never itself add latency to
+(let alone drop) inference traffic.
 """
 
+import asyncio
 import logging
 import time
 from enum import Enum
@@ -40,17 +49,23 @@ class BalanceChecker:
         self._minimum_balance = minimum_balance
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache: Dict[str, Tuple[BalanceStatus, float]] = {}
+        # Orgs with a refresh currently in flight — de-dupes concurrent
+        # misses for the same org into a single background fetch.
+        self._in_flight: Dict[str, asyncio.Task] = {}
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession(headers=self._headers)
 
     async def stop(self) -> None:
+        if self._in_flight:
+            await asyncio.gather(*self._in_flight.values(), return_exceptions=True)
         if self._session:
             await self._session.close()
 
     async def check(self, org_uuid: str) -> BalanceStatus:
-        """Whether `org_uuid` may proceed. Never blocks on a FlexPrice API
-        failure — only a confirmed suspended/insufficient-balance result does.
+        """Whether `org_uuid` may proceed. Returns instantly from cache; on a
+        miss, fails open for this call and refreshes the cache in the
+        background — never awaits a live FlexPrice call.
         """
         cached = self._cache.get(org_uuid)
         if cached is not None:
@@ -58,9 +73,15 @@ class BalanceChecker:
             if time.monotonic() < expires_at:
                 return status
 
+        if org_uuid not in self._in_flight:
+            task = asyncio.create_task(self._refresh(org_uuid))
+            self._in_flight[org_uuid] = task
+            task.add_done_callback(lambda _t, o=org_uuid: self._in_flight.pop(o, None))
+        return BalanceStatus.OK
+
+    async def _refresh(self, org_uuid: str) -> None:
         status = await self._fetch(org_uuid)
         self._cache[org_uuid] = (status, time.monotonic() + _CACHE_TTL_SECS)
-        return status
 
     async def _fetch(self, org_uuid: str) -> BalanceStatus:
         if not self._session:

@@ -58,6 +58,8 @@ pub async fn auth_middleware(
     // Wallet balance gate: prepaid orgs below the configured minimum balance
     // (negative by default) are blocked; postpaid orgs bypass this entirely.
     // Only runs when FlexPrice billing is enabled — no wallet, no gate.
+    // `check` never awaits a live FlexPrice call (see balance.rs) — it's
+    // cache-only-or-fail-open, so this never adds network latency here.
     if let Some(checker) = state.flexprice_balance_checker() {
         match checker.check(&ctx.org_uuid).await {
             BalanceStatus::Ok => {}
