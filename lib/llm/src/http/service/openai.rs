@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::Request,
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
@@ -35,6 +35,7 @@ use super::{
     RouteDoc,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     error::HttpError,
+    flexprice,
     metrics::{
         CancellationLabels, Endpoint, ErrorType, EventConverter,
         process_response_and_observe_metrics,
@@ -60,6 +61,7 @@ use crate::protocols::openai::{
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::{RequestTemplate, resolve_request_model};
 use crate::types::Annotated;
+use dynamo_protocols::types::ChatCompletionStreamOptions;
 use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
 use dynamo_protocols::types::Choice;
 use dynamo_runtime::logging::get_distributed_tracing_context;
@@ -424,11 +426,16 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
 /// non-streaming requests, we will fold the stream into a single response as part of this handler.
 async fn handler_completions(
     State(state): State<Arc<service_v2::State>>,
+    maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(mut request): Json<NvCreateCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
@@ -457,14 +464,16 @@ async fn handler_completions(
 
     // possibly long running task
     // if this returns a streaming response, the stream handle will be armed and captured by the response stream
-    let response = tokio::spawn(completions(state, request, stream_handle).in_current_span())
-        .await
-        .map_err(|e| {
-            ErrorMessage::internal_server_error(&format!(
-                "Failed to await chat completions task: {:?}",
-                e,
-            ))
-        })?;
+    let response = tokio::spawn(
+        completions(state, request, stream_handle, org_uuid, user_uuid).in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        ErrorMessage::internal_server_error(&format!(
+            "Failed to await chat completions task: {:?}",
+            e,
+        ))
+    })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -478,6 +487,8 @@ async fn completions(
     state: Arc<service_v2::State>,
     request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
+    org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
 
@@ -495,19 +506,21 @@ async fn completions(
 
     // If single prompt or single-element batch, use original flow
     if batch_size == 1 {
-        return completions_single(state, request, stream_handle).await;
+        return completions_single(state, request, stream_handle, org_uuid, user_uuid).await;
     }
 
     // Batch processing: handle multiple prompts
-    completions_batch(state, request, stream_handle, batch_size, n).await
+    completions_batch(state, request, stream_handle, batch_size, n, org_uuid, user_uuid).await
 }
 
 /// Handle single prompt completions (original logic)
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
+    org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
 
@@ -518,6 +531,25 @@ async fn completions_single(
     // todo - when optional, if none, apply a default
     let model = request.inner.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
+
+    // No-op shell unless DYN_FLEXPRICE_ENABLED=true and the request carries a
+    // JWT-verified org id (see `flexprice::auth_middleware`).
+    let mut usage_guard = flexprice::UsageBillingGuard::new(
+        state.flexprice_client(),
+        state.flexprice_config(),
+        org_uuid.as_deref(),
+        user_uuid.as_deref(),
+        &request_id,
+        &metric_model,
+        streaming,
+    );
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
+    }
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -596,6 +628,12 @@ async fn completions_single(
                 )
             })
             .map(move |response| {
+                // Usage only appears on the final chunk; the guard is dropped
+                // — and the billing event enqueued — once this closure itself
+                // is dropped at stream end.
+                if let Some(data) = response.data.as_ref() {
+                    usage_guard.record_usage_opt(data.inner.usage.as_ref());
+                }
                 // Calls observe_response() on each token
                 process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
@@ -645,6 +683,8 @@ async fn completions_single(
                 err_response
             })?;
 
+        usage_guard.record_usage_opt(response.inner.usage.as_ref());
+
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
         // assembled but never delivered. Override to cancelled.
@@ -659,10 +699,12 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
+    org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::extract_single_prompt;
     use futures::stream::{self, StreamExt};
@@ -671,6 +713,28 @@ async fn completions_batch(
     let streaming = request.inner.stream.unwrap_or(false);
     let model = request.inner.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
+
+    // No-op shell unless DYN_FLEXPRICE_ENABLED=true and the request carries a
+    // JWT-verified org id (see `flexprice::auth_middleware`). Constructed once
+    // for the whole batch so usage sums across every prompt, not per-prompt.
+    let mut usage_guard = flexprice::UsageBillingGuard::new(
+        state.flexprice_client(),
+        state.flexprice_config(),
+        org_uuid.as_deref(),
+        user_uuid.as_deref(),
+        &request_id,
+        &metric_model,
+        streaming,
+    );
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    // Set once here — each per-prompt request clones `request.content()`
+    // further down, inheriting this.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
+    }
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -788,6 +852,12 @@ async fn completions_batch(
                 )
             })
             .map(move |response| {
+                // Usage only appears on the final chunk; the guard is dropped
+                // — and the billing event enqueued — once this closure itself
+                // is dropped at stream end.
+                if let Some(data) = response.data.as_ref() {
+                    usage_guard.record_usage_opt(data.inner.usage.as_ref());
+                }
                 // Calls observe_response() on each token
                 process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
@@ -837,6 +907,8 @@ async fn completions_batch(
                 err_response
             })?;
 
+        usage_guard.record_usage_opt(response.inner.usage.as_ref());
+
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
         // assembled but never delivered. Override to cancelled.
@@ -850,11 +922,16 @@ async fn completions_batch(
 #[tracing::instrument(skip_all)]
 async fn embeddings(
     State(state): State<Arc<service_v2::State>>,
+    maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(request): Json<NvCreateEmbeddingRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     let request_id = get_or_create_request_id(&headers);
     let request = Context::with_id(request, request_id);
@@ -867,6 +944,18 @@ async fn embeddings(
     // todo - when optional, if none, apply a default
     let model = &request.inner.model;
     let metric_model = state.manager().metric_model_for(model).to_string();
+
+    // No-op shell unless DYN_FLEXPRICE_ENABLED=true and the request carries a
+    // JWT-verified org id (see `flexprice::auth_middleware`).
+    let mut usage_guard = flexprice::UsageBillingGuard::new(
+        state.flexprice_client(),
+        state.flexprice_config(),
+        org_uuid.as_deref(),
+        user_uuid.as_deref(),
+        &request_id,
+        &metric_model,
+        streaming,
+    );
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
@@ -930,17 +1019,24 @@ async fn embeddings(
             err_response
         })?;
 
+    usage_guard.record_embedding_usage(&response.inner.usage);
+
     inflight.mark_ok();
     Ok(Json(response).into_response())
 }
 
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(mut request): Json<NvCreateChatCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
 
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
@@ -965,15 +1061,17 @@ async fn handler_chat_completions(
     )
     .await;
 
-    let response =
-        tokio::spawn(chat_completions(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await chat completions task: {:?}",
-                    e,
-                ))
-            })?;
+    let response = tokio::spawn(
+        chat_completions(state, template, request, stream_handle, org_uuid, user_uuid)
+            .in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        ErrorMessage::internal_server_error(&format!(
+            "Failed to await chat completions task: {:?}",
+            e,
+        ))
+    })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -1262,6 +1360,8 @@ async fn chat_completions(
     template: Option<RequestTemplate>,
     mut request: Context<NvCreateChatCompletionRequest>,
     mut stream_handle: ConnectionHandle,
+    org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -1291,6 +1391,18 @@ async fn chat_completions(
     // todo - determine the proper error code for when a request model is not present
     let model = request.inner.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
+
+    // No-op shell unless DYN_FLEXPRICE_ENABLED=true and the request carries a
+    // JWT-verified org id (see `flexprice::auth_middleware`).
+    let mut usage_guard = flexprice::UsageBillingGuard::new(
+        state.flexprice_client(),
+        state.flexprice_config(),
+        org_uuid.as_deref(),
+        user_uuid.as_deref(),
+        &request_id,
+        &metric_model,
+        streaming,
+    );
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
@@ -1327,6 +1439,13 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
+    }
+
+    // Without this, a streaming request that never asked for
+    // stream_options.include_usage carries no usage on any chunk, so the
+    // billing guard below never records anything and no event is enqueued.
+    if streaming && usage_guard.is_active() {
+        force_include_usage(&mut request.inner.stream_options);
     }
 
     // Create HTTP queue guard after template resolution so labels are correct
@@ -1422,6 +1541,13 @@ async fn chat_completions(
                 ));
             }
 
+            // Usage only appears on the final chunk (stream_options.include_usage
+            // is force-set true below); the guard is dropped — and the billing
+            // event enqueued — once this closure itself is dropped at stream end.
+            if let Some(data) = response.data.as_ref() {
+                usage_guard.record_usage_opt(data.inner.usage.as_ref());
+            }
+
             // Convert to SSE event (this consumes the response).
             // EventConverter will detect `event: "error"` and convert to SSE error events.
             let sse_result = process_response_using_event_converter_and_observe_metrics(
@@ -1484,6 +1610,8 @@ async fn chat_completions(
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
+
+        usage_guard.record_usage_opt(response.inner.usage.as_ref());
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1582,6 +1710,27 @@ pub fn validate_completion_stream_options(
         }));
     }
     Ok(())
+}
+
+/// Forces `include_usage` on an outgoing streaming request's `stream_options`
+/// so the engine sends token counts on the final chunk — without this, a
+/// client that didn't explicitly request `stream_options.include_usage` never
+/// gets a `usage` field on any chunk, so `UsageBillingGuard::record_usage_opt`
+/// never records anything and no billing event is ever enqueued for that
+/// stream. Only called when a billing guard is actually active (see
+/// `UsageBillingGuard::is_active`), so non-billed streaming traffic is
+/// unaffected. Preserves any `continuous_usage_stats` the client requested.
+fn force_include_usage(stream_options: &mut Option<ChatCompletionStreamOptions>) {
+    *stream_options = Some(match stream_options.take() {
+        Some(mut opts) => {
+            opts.include_usage = true;
+            opts
+        }
+        None => ChatCompletionStreamOptions {
+            include_usage: true,
+            continuous_usage_stats: false,
+        },
+    });
 }
 
 /// Validates a completion request and returns an error response if validation fails.
@@ -2747,6 +2896,27 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn force_include_usage_sets_it_when_absent() {
+        let mut stream_options = None;
+        force_include_usage(&mut stream_options);
+        let opts = stream_options.expect("stream_options must be Some");
+        assert!(opts.include_usage);
+        assert!(!opts.continuous_usage_stats);
+    }
+
+    #[test]
+    fn force_include_usage_preserves_continuous_usage_stats() {
+        let mut stream_options = Some(ChatCompletionStreamOptions {
+            include_usage: false,
+            continuous_usage_stats: true,
+        });
+        force_include_usage(&mut stream_options);
+        let opts = stream_options.expect("stream_options must be Some");
+        assert!(opts.include_usage);
+        assert!(opts.continuous_usage_stats);
+    }
 
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {

@@ -167,6 +167,11 @@ async def async_main():
 
     Initializes the distributed runtime, configures routing, and starts
     the HTTP server or interactive mode based on command-line arguments.
+
+    Auth and FlexPrice billing (DYN_AUTH_ENABLED / DYN_FLEXPRICE_ENABLED) are
+    handled natively by the Rust Dynamo HTTP service itself
+    (lib/llm/src/http/service/flexprice/) — it reads those env vars directly
+    from this same process, so no separate proxy or port-split is needed here.
     """
     # The system status server port is a worker concern.
     #
@@ -176,6 +181,7 @@ async def async_main():
     # wrong metrics endpoint.
     os.environ.pop("DYN_SYSTEM_PORT", None)
     config, vllm_flags, sglang_flags = parse_args()
+
     dump_config(config.dump_config_to, config)
     if config.event_plane:
         os.environ["DYN_EVENT_PLANE"] = config.event_plane

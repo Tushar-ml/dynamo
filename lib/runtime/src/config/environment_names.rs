@@ -293,6 +293,47 @@ pub mod llm {
     pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str =
         "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
 
+    /// Enable JWT bearer-token authentication on inference endpoints (set to "true" to enable)
+    pub const DYN_AUTH_ENABLED: &str = "DYN_AUTH_ENABLED";
+
+    /// Comma-separated HMAC secret key(s) for JWT validation (supports key rotation)
+    pub const DYN_AUTH_SECRET_KEY: &str = "DYN_AUTH_SECRET_KEY";
+
+    /// Comma-separated org UUID allowlist; empty = allow all authenticated orgs
+    pub const DYN_AUTH_VALID_ORGS: &str = "DYN_AUTH_VALID_ORGS";
+
+    /// Enable async FlexPrice usage-event billing (set to "true" to enable; requires DYN_AUTH_ENABLED)
+    pub const DYN_FLEXPRICE_ENABLED: &str = "DYN_FLEXPRICE_ENABLED";
+
+    /// FlexPrice API key
+    pub const DYN_FLEXPRICE_API_KEY: &str = "DYN_FLEXPRICE_API_KEY";
+
+    /// FlexPrice API host, e.g. "api.flexprice.io"
+    pub const DYN_FLEXPRICE_API_HOST: &str = "DYN_FLEXPRICE_API_HOST";
+
+    /// Override billing event name (default: "{model}-llm-usage")
+    pub const DYN_FLEXPRICE_EVENT_NAME: &str = "DYN_FLEXPRICE_EVENT_NAME";
+
+    /// Override billing source name (default: "{deployment_name}_{deployment_id}")
+    pub const DYN_FLEXPRICE_SOURCE_NAME: &str = "DYN_FLEXPRICE_SOURCE_NAME";
+
+    /// Human-readable deployment name, used to build the default billing source
+    /// (default: "dynamo")
+    pub const DYN_DEPLOYMENT_NAME: &str = "DYN_DEPLOYMENT_NAME";
+
+    /// Deployment/instance id, used to build the default billing source
+    /// (default: "local")
+    pub const DYN_DEPLOYMENT_ID: &str = "DYN_DEPLOYMENT_ID";
+
+    /// Minimum wallet balance (in FlexPrice's currency units) required for a
+    /// prepaid org to be allowed to make inference requests. Postpaid orgs are
+    /// always allowed regardless of balance. (default: "0")
+    pub const DYN_FLEXPRICE_MINIMUM_BALANCE: &str = "DYN_FLEXPRICE_MINIMUM_BALANCE";
+
+    /// Max pending usage events buffered by FlexPriceClient before new events
+    /// are dropped (default: 4500).
+    pub const DYN_FLEXPRICE_QUEUE_SIZE: &str = "DYN_FLEXPRICE_QUEUE_SIZE";
+
     /// Backend stream inactivity timeout in seconds.
     ///
     /// When set to a positive integer, the frontend will kill the engine context
