@@ -317,6 +317,9 @@ pub mod llm {
     /// Override billing source name (default: "{deployment_name}_{deployment_id}")
     pub const DYN_FLEXPRICE_SOURCE_NAME: &str = "DYN_FLEXPRICE_SOURCE_NAME";
 
+    /// Bill cached prompt tokens separately from input tokens (set to "true" to enable)
+    pub const DYN_FLEXPRICE_TRACK_CACHED_TOKENS: &str = "DYN_FLEXPRICE_TRACK_CACHED_TOKENS";
+
     /// Human-readable deployment name, used to build the default billing source
     /// (default: "dynamo")
     pub const DYN_DEPLOYMENT_NAME: &str = "DYN_DEPLOYMENT_NAME";

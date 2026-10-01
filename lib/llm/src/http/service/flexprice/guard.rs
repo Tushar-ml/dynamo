@@ -29,8 +29,10 @@ pub struct UsageBillingGuard {
     source: String,
     model: String,
     streaming: bool,
+    track_cached_tokens: bool,
     start: Instant,
     input_tokens: u64,
+    cached_tokens: u64,
     output_tokens: u64,
     total_tokens: u64,
     usage_recorded: bool,
@@ -60,8 +62,10 @@ impl UsageBillingGuard {
             request_id: request_id.to_string(),
             model: model.to_string(),
             streaming,
+            track_cached_tokens: config.track_cached_tokens,
             start: Instant::now(),
             input_tokens: 0,
+            cached_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
             usage_recorded: false,
@@ -81,6 +85,13 @@ impl UsageBillingGuard {
     /// more than once (e.g. per streamed chunk); fields accumulate.
     pub fn record_usage(&mut self, usage: &CompletionUsage) {
         self.input_tokens += usage.prompt_tokens as u64;
+        if self.track_cached_tokens {
+            self.cached_tokens += usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0) as u64;
+        }
         self.output_tokens += usage.completion_tokens as u64;
         self.total_tokens += usage.total_tokens as u64;
         self.usage_recorded = true;
@@ -99,6 +110,11 @@ impl UsageBillingGuard {
         self.total_tokens += usage.total_tokens as u64;
         self.usage_recorded = true;
     }
+
+    /// Prompt tokens not served from the prefix cache.
+    fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_tokens)
+    }
 }
 
 impl Drop for UsageBillingGuard {
@@ -114,7 +130,11 @@ impl Drop for UsageBillingGuard {
         properties.insert("model_id".to_string(), self.model.clone());
         properties.insert("user_id".to_string(), self.user_uuid.clone());
         properties.insert("request_id".to_string(), self.request_id.clone());
-        properties.insert("input_tokens".to_string(), self.input_tokens.to_string());
+        properties.insert(
+            "input_tokens".to_string(),
+            self.uncached_input_tokens().to_string(),
+        );
+        properties.insert("cached_tokens".to_string(), self.cached_tokens.to_string());
         properties.insert("output_tokens".to_string(), self.output_tokens.to_string());
         properties.insert("total_tokens".to_string(), self.total_tokens.to_string());
         properties.insert(
@@ -192,6 +212,43 @@ mod tests {
         assert_eq!(guard.input_tokens, 10);
         assert_eq!(guard.output_tokens, 8);
         assert_eq!(guard.total_tokens, 18);
+    }
+
+    fn usage_with_cache(prompt: u32, completion: u32, cached: Option<u32>) -> CompletionUsage {
+        CompletionUsage {
+            prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
+                audio_tokens: None,
+                cached_tokens: cached,
+            }),
+            ..usage(prompt, completion, prompt + completion)
+        }
+    }
+
+    #[test]
+    fn cached_tokens_deducted_from_input_when_tracking_enabled() {
+        let config = FlexPriceConfig {
+            track_cached_tokens: true,
+            ..Default::default()
+        };
+        let mut guard = UsageBillingGuard::new(
+            None, &config, Some("org-1"), Some("user-1"), "req-1", "model", false,
+        );
+        guard.record_usage(&usage_with_cache(1024, 100, Some(896)));
+        assert_eq!(guard.cached_tokens, 896);
+        assert_eq!(guard.uncached_input_tokens(), 128);
+        assert_eq!(guard.output_tokens, 100);
+        assert_eq!(guard.total_tokens, 1124);
+    }
+
+    #[test]
+    fn cached_tokens_ignored_when_tracking_disabled() {
+        let config = FlexPriceConfig::default();
+        let mut guard = UsageBillingGuard::new(
+            None, &config, Some("org-1"), Some("user-1"), "req-1", "model", false,
+        );
+        guard.record_usage(&usage_with_cache(1024, 100, Some(896)));
+        assert_eq!(guard.cached_tokens, 0);
+        assert_eq!(guard.uncached_input_tokens(), 1024);
     }
 
     #[test]
