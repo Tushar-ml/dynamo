@@ -55,6 +55,8 @@ pub struct FlexPriceConfig {
     /// Minimum wallet balance required for a prepaid org to be allowed
     /// through. Postpaid orgs bypass this check entirely.
     pub minimum_balance: f64,
+    /// Bill cached prompt tokens separately from input tokens.
+    pub track_cached_tokens: bool,
 }
 
 impl FlexPriceConfig {
@@ -76,6 +78,9 @@ impl FlexPriceConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
+            track_cached_tokens: dynamo_runtime::config::env_is_truthy(
+                env_llm::DYN_FLEXPRICE_TRACK_CACHED_TOKENS,
+            ),
         }
     }
 
