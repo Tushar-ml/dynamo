@@ -1208,16 +1208,56 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
                 | ConditionalDisaggPolicyKind::CacheOrLoad,
         )
     {
+        if let Some(t) = config.conditional_disagg_prefill_busy_threshold
+            && t > 1.0
+        {
+            tracing::warn!(
+                prefill_busy_threshold = t,
+                "conditional_disagg prefill_busy_threshold is a FRACTION of prefill_token_capacity, \
+                 not a token count, so a value above 1.0 can never trip. Set target_ttft_ms to gate \
+                 on predicted queue wait instead, or use a fraction such as 0.8"
+            );
+        }
+        // The SLO gate SUPERSEDES prefill_busy_threshold inside `prefill_worker_busy`, so logging
+        // the occupancy threshold while the SLO one is in force tells an operator the opposite of
+        // what is running. Report the gate that actually decides, and say the other is inert.
+        match (
+            config.conditional_disagg_target_ttft_ms,
+            config.router_prefill_linear_tok_per_s,
+        ) {
+            (Some(budget_ms), Some(rate)) => {
+                tracing::info!(
+                    target_ttft_ms = budget_ms,
+                    prefill_linear_tok_per_s = rate,
+                    trips_above_active_prefill_tokens = budget_ms * rate / 1000.0,
+                    superseded_busy_threshold =
+                        ?config.conditional_disagg_prefill_busy_threshold,
+                    "conditional_disagg prefill-load condition is the SLO gate: bypass when the \
+                     selected prefill worker's predicted queue wait (active_prefill_tokens / \
+                     tokens_per_second) exceeds the TTFT budget. prefill_busy_threshold is INERT \
+                     while this is set"
+                );
+            }
+            _ => {}
+        }
         match (
             config.conditional_disagg_prefill_busy_threshold,
             config.router_queue_threshold,
         ) {
-            (Some(threshold), _) => {
+            (Some(threshold), _) if config.conditional_disagg_target_ttft_ms.is_none() => {
                 tracing::info!(
                     busy_threshold = threshold,
+                    busy_threshold_is_a_fraction_of_prefill_token_capacity = true,
+                    trips_above_active_prefill_tokens =
+                        "threshold x prefill_token_capacity -- NOT a token count",
                     "conditional_disagg prefill-load condition using --router-conditional-disagg-config {{\"prefill_busy_threshold\": ...}}"
                 );
             }
+            (Some(_), _) => {}
+            // Deliberately a warning, not a rejection. Production runs 1200 today; making that a
+            // hard error would refuse to boot the deployment this is meant to help. But a value
+            // above 1.0 is a threshold on a FRACTION of capacity, so it can never trip, and
+            // silently accepting it is how exp-0087 spent an afternoon tuning a dead knob.
             (None, Some(threshold)) => {
                 tracing::info!(
                     inherited_threshold = threshold,
