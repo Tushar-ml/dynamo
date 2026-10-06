@@ -239,6 +239,9 @@ where
     /// Resolved once at construction: dedicated threshold if set, otherwise
     /// `router_queue_threshold`. `None` means the prefill-load condition is disabled.
     conditional_disagg_prefill_busy_threshold: Option<f64>,
+    /// `(budget_ms, tokens_per_second)`; when present the prefill gate trips on predicted queue
+    /// wait rather than on occupancy. Resolved once at activation so the hot path compares f64s.
+    conditional_disagg_prefill_wait_slo: Option<(f64, f64)>,
     /// Dedicated decode-busy guard threshold. `None` means disabled.
     conditional_disagg_decode_busy_threshold: Option<f64>,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,

@@ -205,8 +205,32 @@ pub struct AdvisoryWorkerLoad {
 }
 
 impl AdvisoryWorkerLoad {
+    /// NOTE ON UNITS: `threshold` is a FRACTION OF CAPACITY, not a token count. `1200` means
+    /// 1200x `prefill_token_capacity`, which is unreachable, so the gate never trips. This has
+    /// already cost one experiment that tuned the value from 1200 to 300 and correctly measured
+    /// no effect. Prefer `prefill_wait_exceeds`, which is in units an operator can reason about.
     pub fn prefill_load_exceeds(&self, threshold: f64) -> bool {
         self.active_prefill_tokens as f64 > threshold * self.prefill_token_capacity as f64
+    }
+
+    /// Predicted queue wait, in milliseconds, for work arriving behind the prefill backlog this
+    /// worker is already carrying: `active_prefill_tokens / tokens_per_second`.
+    ///
+    /// This is the quantity that actually governs TTFT on a disaggregated stack. Measured on
+    /// dsv41-flash / 8xB300: a backlog of ~3.7M tokens draining at ~175k tok/s gives ~21.9 s of
+    /// residence against ~23 s of observed TTFT, i.e. ~94% of TTFT is this wait. Occupancy
+    /// fractions do not express that; a time does.
+    ///
+    /// `None` when the rate is not configured or not usable, which the caller must treat as
+    /// "unknown" and NOT as "fast" -- the same trap the decode ITL gate documents.
+    pub fn prefill_wait_ms(&self, tokens_per_second: f64) -> Option<f64> {
+        (tokens_per_second.is_finite() && tokens_per_second > 0.0)
+            .then(|| self.active_prefill_tokens as f64 * 1000.0 / tokens_per_second)
+    }
+
+    /// True iff the predicted prefill queue wait exceeds `trip_ms`. `None` means unknown.
+    pub fn prefill_wait_exceeds(&self, trip_ms: f64, tokens_per_second: f64) -> Option<bool> {
+        Some(self.prefill_wait_ms(tokens_per_second)? > trip_ms)
     }
 
     pub fn decode_load_exceeds(
@@ -635,5 +659,51 @@ mod tests {
                 "{name}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod advisory_worker_load_slo_tests {
+    use super::AdvisoryWorkerLoad;
+
+    fn load(active_prefill_tokens: usize) -> AdvisoryWorkerLoad {
+        AdvisoryWorkerLoad {
+            active_prefill_tokens,
+            prefill_token_capacity: 8192,
+            total_kv_blocks: Some(1_000_000),
+        }
+    }
+
+    /// The measured case: 3.7M tokens at 175k tok/s is ~21.1 s, well past a 10 s budget.
+    #[test]
+    fn deep_backlog_trips_a_ten_second_budget() {
+        let wait = load(3_700_000).prefill_wait_ms(175_000.0).unwrap();
+        assert!((wait - 21_142.0).abs() < 1.0, "unexpected wait {wait}");
+        assert_eq!(load(3_700_000).prefill_wait_exceeds(10_000.0, 175_000.0), Some(true));
+    }
+
+    /// An idle worker must not trip it.
+    #[test]
+    fn idle_backlog_does_not_trip() {
+        assert_eq!(load(0).prefill_wait_exceeds(10_000.0, 175_000.0), Some(false));
+    }
+
+    /// An unusable rate is UNKNOWN, never "fast". Returning Some(false) here would silently open
+    /// the gate on the worker we know least about -- the trap the decode ITL gate pins in its own
+    /// tests.
+    #[test]
+    fn unusable_rate_is_unknown_not_fast() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(load(3_700_000).prefill_wait_ms(bad), None, "rate {bad}");
+            assert_eq!(load(3_700_000).prefill_wait_exceeds(10_000.0, bad), None, "rate {bad}");
+        }
+    }
+
+    /// The units trap on the legacy signal, pinned so nobody "fixes" the threshold by making it
+    /// look like a token count: 1200 is 1200x capacity, which 3.7M tokens does not reach.
+    #[test]
+    fn legacy_threshold_is_a_capacity_fraction_not_a_token_count() {
+        assert!(!load(3_700_000).prefill_load_exceeds(1200.0));
+        assert!(load(3_700_000).prefill_load_exceeds(0.5));
     }
 }

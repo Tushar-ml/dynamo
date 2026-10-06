@@ -38,6 +38,15 @@ pub struct ConditionalDisaggDecisionInput {
     /// over the decode-busy line. `None` means the gate is disabled or the
     /// signal is unavailable.
     pub decode_chosen_worker_busy: Option<bool>,
+
+    /// Effective cache credit on the prefill worker the router would pick, in
+    /// weighted tokens. `None` means the probe did not run.
+    pub prefill_chosen_cached_tokens: Option<usize>,
+
+    /// Local patch (dsv41-flash-b300-cost): the router's tracked in-flight
+    /// prefill tokens on the decode worker it would pick (overflow prefill
+    /// already admitted there). `None` means the signal is unavailable.
+    pub decode_chosen_active_prefill_tokens: Option<usize>,
 }
 
 impl ConditionalDisaggDecisionInput {
@@ -47,7 +56,19 @@ impl ConditionalDisaggDecisionInput {
             decode_chosen_cached_tokens,
             prefill_chosen_worker_busy: None,
             decode_chosen_worker_busy: None,
+            prefill_chosen_cached_tokens: None,
+            decode_chosen_active_prefill_tokens: None,
         }
+    }
+
+    pub fn with_decode_chosen_active_prefill_tokens(mut self, tokens: Option<usize>) -> Self {
+        self.decode_chosen_active_prefill_tokens = tokens;
+        self
+    }
+
+    pub fn with_prefill_chosen_cached_tokens(mut self, cached: Option<usize>) -> Self {
+        self.prefill_chosen_cached_tokens = cached;
+        self
     }
 
     pub fn with_prefill_chosen_worker_busy(mut self, busy: Option<bool>) -> Self {
@@ -98,6 +119,9 @@ pub fn make_conditional_disagg_policy(
             Box::new(PrefillLoadPolicy::from_config(config))
         }
         ConditionalDisaggPolicyKind::IslOrLoad => Box::new(IslOrLoadPolicy::from_config(config)),
+        ConditionalDisaggPolicyKind::CacheOrLoad => {
+            Box::new(CacheOrLoadPolicy::from_config(config))
+        }
     }
 }
 
@@ -206,6 +230,75 @@ impl ConditionalDisaggPolicy for PrefillLoadPolicy {
             return false;
         }
         input.prefill_chosen_worker_busy.unwrap_or(false)
+    }
+
+    fn needs_prefill_worker_busy(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Local patch (dsv41-flash-b300-cost): bypass when the decode worker holds the
+/// request's prefix but the chosen prefill worker does not (a remote prefill
+/// would recompute what decode already has: e.g. a follow-up turn whose first
+/// turn was prefilled locally on decode during a burst), or when the chosen
+/// prefill worker is busy. In steady-state PD both hold the history, so
+/// follow-ups keep going to prefill (no mixed prefill on decode).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheOrLoadPolicy {
+    enabled: bool,
+    eff_isl_threshold: usize,
+    load: PrefillLoadPolicy,
+    /// `busy_max_net_new`: cap on decode-side net-new tokens for the load arm.
+    busy_max_net_new: Option<usize>,
+    /// `cold_decode_budget`: a request over the cap may still bypass while the
+    /// chosen decode rank's in-flight prefill plus this request fits the budget.
+    cold_decode_budget: Option<usize>,
+}
+
+impl CacheOrLoadPolicy {
+    pub fn from_config(config: &KvRouterConfig) -> Self {
+        Self {
+            enabled: config.conditional_disagg_enabled,
+            eff_isl_threshold: config.conditional_disagg_eff_isl_threshold,
+            load: PrefillLoadPolicy::from_config(config),
+            busy_max_net_new: config.conditional_disagg_busy_max_net_new,
+            cold_decode_budget: config.conditional_disagg_cold_decode_budget,
+        }
+    }
+}
+
+#[async_trait]
+impl ConditionalDisaggPolicy for CacheOrLoadPolicy {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    async fn should_bypass_remote_prefill(&self, input: ConditionalDisaggDecisionInput) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let decode_net_new = input.net_new_tokens();
+        let prefill_net_new = input
+            .prompt_tokens
+            .saturating_sub(input.prefill_chosen_cached_tokens.unwrap_or(0).min(input.prompt_tokens));
+        let decode_holds_prefix_prefill_does_not = input.prefill_chosen_cached_tokens.is_some()
+            && decode_net_new < self.eff_isl_threshold
+            && prefill_net_new >= decode_net_new.saturating_add(self.eff_isl_threshold);
+        if decode_holds_prefix_prefill_does_not {
+            return true;
+        }
+        // Load arm: only cheap-on-decode requests when `busy_max_net_new` is set,
+        // plus cold ones that fit the chosen decode rank's `cold_decode_budget`.
+        if self.busy_max_net_new.is_some_and(|cap| decode_net_new >= cap) {
+            let fits_budget = match (self.cold_decode_budget, input.decode_chosen_active_prefill_tokens) {
+                (Some(budget), Some(active)) => active.saturating_add(decode_net_new) <= budget,
+                _ => false,
+            };
+            if !fits_budget {
+                return false;
+            }
+        }
+        self.load.should_bypass_remote_prefill(input).await
     }
 
     fn needs_prefill_worker_busy(&self) -> bool {
@@ -576,4 +669,63 @@ mod tests {
         assert_eq!(input.decode_chosen_worker_busy, Some(true));
         assert_eq!(input.prefill_chosen_worker_busy, None);
     }
+
+    fn cache_or_load() -> CacheOrLoadPolicy {
+        CacheOrLoadPolicy { enabled: true, eff_isl_threshold: 16384, load: PrefillLoadPolicy::new(true), busy_max_net_new: None, cold_decode_budget: None }
+    }
+
+    #[tokio::test]
+    async fn cache_or_load_bypasses_follow_up_cached_only_on_decode() {
+        // 170k-token follow-up: decode has 167k cached, chosen prefill worker has none.
+        let input = ConditionalDisaggDecisionInput::new(170_000, 167_000)
+            .with_prefill_chosen_worker_busy(Some(false))
+            .with_prefill_chosen_cached_tokens(Some(0));
+        assert!(cache_or_load().should_bypass_remote_prefill(input).await);
+    }
+
+    #[tokio::test]
+    async fn cache_or_load_keeps_steady_state_pd_follow_up_on_prefill() {
+        // Both hold the history (normal PD): no bypass while prefill is not busy.
+        let input = ConditionalDisaggDecisionInput::new(170_000, 167_000)
+            .with_prefill_chosen_worker_busy(Some(false))
+            .with_prefill_chosen_cached_tokens(Some(167_000));
+        assert!(!cache_or_load().should_bypass_remote_prefill(input).await);
+        // ... but a busy prefill worker still triggers the load bypass.
+        let busy = input.with_prefill_chosen_worker_busy(Some(true));
+        assert!(cache_or_load().should_bypass_remote_prefill(busy).await);
+        // Cold first turn, prefill idle: stays disaggregated.
+        let cold = ConditionalDisaggDecisionInput::new(170_000, 0)
+            .with_prefill_chosen_worker_busy(Some(false))
+            .with_prefill_chosen_cached_tokens(Some(0));
+        assert!(!cache_or_load().should_bypass_remote_prefill(cold).await);
+    }
+
+    #[tokio::test]
+    async fn cache_or_load_busy_max_net_new_keeps_cold_prompts_on_prefill() {
+        let capped = CacheOrLoadPolicy { busy_max_net_new: Some(32_768), ..cache_or_load() };
+        // Prefill busy, follow-up whose history decode holds (3k net new): still bypasses.
+        let follow_up = ConditionalDisaggDecisionInput::new(170_000, 167_000)
+            .with_prefill_chosen_worker_busy(Some(true))
+            .with_prefill_chosen_cached_tokens(Some(167_000));
+        assert!(capped.should_bypass_remote_prefill(follow_up).await);
+        // Prefill busy, cold 85k-token burst prompt: stays on prefill under the cap ...
+        let cold = ConditionalDisaggDecisionInput::new(85_000, 0)
+            .with_prefill_chosen_worker_busy(Some(true))
+            .with_prefill_chosen_cached_tokens(Some(0));
+        assert!(!capped.should_bypass_remote_prefill(cold).await);
+        // ... and goes to decode without it (unchanged behaviour when unset).
+        assert!(cache_or_load().should_bypass_remote_prefill(cold).await);
+        // cold_decode_budget: the cold prompt bypasses only while it fits the decode rank's budget.
+        let budgeted = CacheOrLoadPolicy { cold_decode_budget: Some(200_000), ..capped };
+        assert!(budgeted.should_bypass_remote_prefill(cold.with_decode_chosen_active_prefill_tokens(Some(100_000))).await);
+        assert!(!budgeted.should_bypass_remote_prefill(cold.with_decode_chosen_active_prefill_tokens(Some(150_000))).await);
+        // unknown decode load: stays on prefill
+        assert!(!budgeted.should_bypass_remote_prefill(cold).await);
+        // The cache arm is not capped: decode holds the prefix, prefill does not.
+        let cache_arm = ConditionalDisaggDecisionInput::new(170_000, 160_000)
+            .with_prefill_chosen_worker_busy(Some(false))
+            .with_prefill_chosen_cached_tokens(Some(0));
+        assert!(capped.should_bypass_remote_prefill(cache_arm).await);
+    }
+
 }

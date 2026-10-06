@@ -118,6 +118,7 @@ where
             cached_tokens: selection.cached_tokens,
             potential_decode_blocks: selection.potential_decode_blocks,
             total_kv_blocks,
+            active_prefill_tokens: selection.selected_worker_load.map(|load| load.active_prefill_tokens),
         }
     }
 
@@ -263,11 +264,19 @@ where
         }
     }
 
+    /// Returns (busy, cached tokens on the chosen prefill worker). Local patch:
+    /// the cached-token credit feeds the `cache_or_load` conditional-disagg policy.
+    /// `slo` is `(ttft_budget_ms, tokens_per_second)`. When present, "busy" means the PREDICTED
+    /// QUEUE WAIT behind this worker's prefill backlog exceeds the budget, rather than occupancy
+    /// exceeding a fraction of capacity. An unknown wait (no usable rate) is treated as NOT busy,
+    /// matching the existing occupancy behaviour: this probe only ever proposes a local-prefill
+    /// bypass, so failing closed here would silently disable the gate rather than protect anything.
     pub(crate) async fn prefill_worker_busy(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         threshold: f64,
-    ) -> Result<bool, Error> {
+        slo: Option<(f64, f64)>,
+    ) -> Result<(bool, Option<usize>), Error> {
         // A local budget is sound here and only here: the probe is pinned to
         // `RequestPhase::Prefill`, which never selects `DispatchWhenStopped`, so
         // nothing it runs can arm or spend a budget.
@@ -292,9 +301,17 @@ where
         match outcome {
             SelectionOutcome::Routed(selection) => selection
                 .selected_worker_load
-                .map(|load| load.prefill_load_exceeds(threshold))
+                .map(|load| {
+                    let busy = match slo {
+                        Some((budget_ms, rate)) => load
+                            .prefill_wait_exceeds(budget_ms, rate)
+                            .unwrap_or_else(|| load.prefill_load_exceeds(threshold)),
+                        None => load.prefill_load_exceeds(threshold),
+                    };
+                    (busy, Some(selection.cached_tokens))
+                })
                 .ok_or_else(|| anyhow::anyhow!("advisory prefill selection returned no load")),
-            SelectionOutcome::QueueRejected(_) => Ok(true),
+            SelectionOutcome::QueueRejected(_) => Ok((true, None)),
         }
     }
 

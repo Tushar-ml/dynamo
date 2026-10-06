@@ -1606,7 +1606,7 @@ async fn prefill_busy_probe_does_not_admit_a_request() {
     let request = Context::new(request());
     let requests_started_before = router.request_metrics.requests_started_total().get();
 
-    assert!(!router.prefill_worker_busy(&request, 0.5).await.unwrap());
+    assert!(!router.prefill_worker_busy(&request, 0.5, None).await.unwrap().0);
     let loads = router
         .kv_router()
         .get_potential_loads(&[], None, None, None, None)

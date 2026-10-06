@@ -65,6 +65,8 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "conditional_disagg_eff_isl_ratio_threshold",
     "conditional_disagg_prefill_busy_threshold",
     "conditional_disagg_decode_busy_threshold",
+    "conditional_disagg_busy_max_net_new",
+    "conditional_disagg_cold_decode_budget",
     "router_predicted_ttl_secs",
 )
 
@@ -72,9 +74,10 @@ CONDITIONAL_DISAGG_POLICY_CHOICES: tuple[str, ...] = (
     "isl_bounding",
     "prefill_load",
     "isl_or_load",
+    "cache_or_load",  # local patch (dsv41-flash-b300-cost)
 )
 LOAD_AWARE_CONDITIONAL_DISAGG_POLICIES: frozenset[str] = frozenset(
-    {"prefill_load", "isl_or_load"}
+    {"prefill_load", "isl_or_load", "cache_or_load"}
 )
 
 _CONDITIONAL_DISAGG_CONFIG_FIELDS: dict[str, str] = {
@@ -83,6 +86,8 @@ _CONDITIONAL_DISAGG_CONFIG_FIELDS: dict[str, str] = {
     "eff_isl_ratio_threshold": "conditional_disagg_eff_isl_ratio_threshold",
     "prefill_busy_threshold": "conditional_disagg_prefill_busy_threshold",
     "decode_busy_threshold": "conditional_disagg_decode_busy_threshold",
+    "busy_max_net_new": "conditional_disagg_busy_max_net_new",
+    "cold_decode_budget": "conditional_disagg_cold_decode_budget",
 }
 
 _DEPRECATED_OVERLAP_WEIGHT_MESSAGE = (
@@ -227,6 +232,8 @@ class KvRouterConfigBase(ConfigBase):
     conditional_disagg_eff_isl_ratio_threshold: float = 0.7
     conditional_disagg_prefill_busy_threshold: Optional[float] = None
     conditional_disagg_decode_busy_threshold: Optional[float] = None
+    conditional_disagg_busy_max_net_new: Optional[int] = None
+    conditional_disagg_cold_decode_budget: Optional[int] = None
     router_predicted_ttl_secs: Optional[float] = None
     load_aware: bool = False
 

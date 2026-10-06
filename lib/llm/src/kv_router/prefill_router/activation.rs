@@ -182,6 +182,7 @@ where
             session_affinity_mode,
             conditional_disagg_policy: make_conditional_disagg_policy(None),
             conditional_disagg_prefill_busy_threshold: None,
+            conditional_disagg_prefill_wait_slo: None,
             conditional_disagg_decode_busy_threshold: None,
             prefill_load_estimator: None,
             model_name: String::new(), // Not used for disabled router
@@ -220,6 +221,18 @@ where
         let conditional_disagg_decode_busy_threshold = kv_router_config
             .as_ref()
             .and_then(|c| c.conditional_disagg_decode_busy_threshold);
+        // Both halves are required: a budget without a rate cannot be converted into tokens, and a
+        // rate without a budget has nothing to compare against. `validate` already rejects the
+        // former, so a None here simply means the SLO gate is not configured.
+        let conditional_disagg_prefill_wait_slo = kv_router_config.as_ref().and_then(|c| {
+            match (
+                c.conditional_disagg_target_ttft_ms,
+                c.router_prefill_linear_tok_per_s,
+            ) {
+                (Some(budget_ms), Some(rate)) => Some((budget_ms, rate)),
+                _ => None,
+            }
+        });
 
         let router = Arc::new(Self {
             binding: arc_swap::ArcSwapOption::empty(),
@@ -234,6 +247,7 @@ where
             session_affinity_mode,
             conditional_disagg_policy,
             conditional_disagg_prefill_busy_threshold,
+            conditional_disagg_prefill_wait_slo,
             conditional_disagg_decode_busy_threshold,
             prefill_load_estimator,
             model_name,

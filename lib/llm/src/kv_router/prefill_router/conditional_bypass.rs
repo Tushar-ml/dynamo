@@ -77,10 +77,12 @@ where
             .await?;
         let signals = preview.signals();
         let mut input =
-            ConditionalDisaggDecisionInput::new(routing_token_ids.len(), signals.cached_tokens);
+            ConditionalDisaggDecisionInput::new(routing_token_ids.len(), signals.cached_tokens)
+                .with_decode_chosen_active_prefill_tokens(signals.active_prefill_tokens);
         if self.conditional_disagg_policy.needs_prefill_worker_busy() {
-            let busy = match self.peek_prefill_chosen_worker_busy(request).await {
-                Ok(busy) => busy,
+            let (busy, prefill_cached) = match self.peek_prefill_chosen_worker_busy(request).await {
+                Ok(Some((busy, cached))) => (Some(busy), cached),
+                Ok(None) => (None, None),
                 Err(error) if is_cancelled(&error) => return Err(error),
                 Err(error) => {
                     tracing::debug!(
@@ -88,7 +90,7 @@ where
                         %error,
                         "Conditional disagg prefill-load probe failed; treating load as unavailable"
                     );
-                    None
+                    (None, None)
                 }
             };
             tracing::debug!(
@@ -96,7 +98,9 @@ where
                 prefill_chosen_worker_busy = ?busy,
                 "Conditional disagg prefill-load condition inspected selected prefill worker"
             );
-            input = input.with_prefill_chosen_worker_busy(busy);
+            input = input
+                .with_prefill_chosen_worker_busy(busy)
+                .with_prefill_chosen_cached_tokens(prefill_cached);
         }
         let net_new_tokens = input.net_new_tokens();
         let overlap_tokens =
@@ -158,8 +162,16 @@ where
     async fn peek_prefill_chosen_worker_busy(
         &self,
         request: &SingleIn<PreprocessedRequest>,
-    ) -> Result<Option<bool>> {
-        let Some(threshold) = self.conditional_disagg_prefill_busy_threshold else {
+    ) -> Result<Option<(bool, Option<usize>)>> {
+        // The SLO gate supersedes the occupancy gate when configured. Occupancy is a fraction of
+        // capacity -- a unit nobody can state an SLO in, and one that has already produced an
+        // unreachable threshold in production config. The probe still runs when only the legacy
+        // threshold is set, so this is additive.
+        let slo = self.conditional_disagg_prefill_wait_slo;
+        let Some(threshold) = self
+            .conditional_disagg_prefill_busy_threshold
+            .or_else(|| slo.map(|_| f64::INFINITY))
+        else {
             return Ok(None);
         };
         let Some(binding) = self.binding.load_full() else {
@@ -168,7 +180,7 @@ where
         Ok(Some(
             binding
                 .router
-                .prefill_worker_busy(request, threshold)
+                .prefill_worker_busy(request, threshold, slo)
                 .await?,
         ))
     }
@@ -194,6 +206,7 @@ fn log_conditional_disagg_decision(
         net_new_tokens,
         overlap_tokens,
         prefill_chosen_worker_busy = ?input.prefill_chosen_worker_busy,
+        prefill_chosen_cached_tokens = ?input.prefill_chosen_cached_tokens,
         decode_chosen_worker_busy = ?decode_busy,
         cached_tokens = signals.cached_tokens,
         potential_decode_blocks = signals.potential_decode_blocks,

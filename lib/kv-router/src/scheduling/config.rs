@@ -189,6 +189,8 @@ fn log_env_config(config: &KvRouterConfig) {
         conditional_disagg_eff_isl_ratio_threshold = config.conditional_disagg_eff_isl_ratio_threshold,
         conditional_disagg_prefill_busy_threshold = ?config.conditional_disagg_prefill_busy_threshold,
         conditional_disagg_decode_busy_threshold = ?config.conditional_disagg_decode_busy_threshold,
+        conditional_disagg_busy_max_net_new = ?config.conditional_disagg_busy_max_net_new,
+        conditional_disagg_cold_decode_budget = ?config.conditional_disagg_cold_decode_budget,
         router_predicted_ttl_secs = ?config.router_predicted_ttl_secs,
         router_ttl_secs = config.router_ttl_secs,
         router_event_threads = config.router_event_threads,
@@ -325,6 +327,12 @@ fn kv_router_config_from_lookup(
         "DYN_ROUTER_CONDITIONAL_DISAGG_DECODE_BUSY_THRESHOLD",
     ) {
         config.conditional_disagg_decode_busy_threshold = Some(value);
+    }
+    if let Some(value) = parse_usize(&get_env, "DYN_ROUTER_CONDITIONAL_DISAGG_BUSY_MAX_NET_NEW") {
+        config.conditional_disagg_busy_max_net_new = Some(value);
+    }
+    if let Some(value) = parse_usize(&get_env, "DYN_ROUTER_CONDITIONAL_DISAGG_COLD_DECODE_BUDGET") {
+        config.conditional_disagg_cold_decode_budget = Some(value);
     }
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_PREDICTED_TTL_SECS") {
         config.router_predicted_ttl_secs = Some(value);
@@ -474,6 +482,10 @@ pub enum RouterPrefillLoadModel {
     #[default]
     None,
     Aic,
+    /// Built-in `effective_isl / tokens_per_second` model. Needs no external perf model and no
+    /// Python callback, unlike `Aic`. Rate comes from `router_prefill_linear_tok_per_s` and is a
+    /// measured property of the deployment -- see `LinearPrefillLoadEstimator`.
+    Linear,
 }
 
 impl fmt::Display for RouterPrefillLoadModel {
@@ -481,6 +493,7 @@ impl fmt::Display for RouterPrefillLoadModel {
         match self {
             Self::None => f.write_str("none"),
             Self::Aic => f.write_str("aic"),
+            Self::Linear => f.write_str("linear"),
         }
     }
 }
@@ -492,8 +505,9 @@ impl FromStr for RouterPrefillLoadModel {
         match s {
             "none" => Ok(Self::None),
             "aic" => Ok(Self::Aic),
+            "linear" => Ok(Self::Linear),
             _ => Err(format!(
-                "unknown prefill load model: {s:?}, expected 'none' or 'aic'"
+                "unknown prefill load model: {s:?}, expected 'none', 'aic' or 'linear'"
             )),
         }
     }
@@ -516,6 +530,9 @@ pub enum ConditionalDisaggPolicyKind {
     PrefillLoad,
     /// Bypass when either `isl_bounding` or `prefill_load` would bypass.
     IslOrLoad,
+    /// Local patch: bypass when decode holds the prefix and the chosen prefill
+    /// worker does not, or when the chosen prefill worker is busy.
+    CacheOrLoad,
 }
 
 impl fmt::Display for ConditionalDisaggPolicyKind {
@@ -524,6 +541,7 @@ impl fmt::Display for ConditionalDisaggPolicyKind {
             Self::IslBounding => f.write_str("isl_bounding"),
             Self::PrefillLoad => f.write_str("prefill_load"),
             Self::IslOrLoad => f.write_str("isl_or_load"),
+            Self::CacheOrLoad => f.write_str("cache_or_load"),
         }
     }
 }
@@ -536,8 +554,9 @@ impl FromStr for ConditionalDisaggPolicyKind {
             "isl_bounding" => Ok(Self::IslBounding),
             "prefill_load" => Ok(Self::PrefillLoad),
             "isl_or_load" => Ok(Self::IslOrLoad),
+            "cache_or_load" => Ok(Self::CacheOrLoad),
             _ => Err(format!(
-                "unknown conditional_disagg_policy: {s:?}, expected 'isl_bounding', 'prefill_load', or 'isl_or_load'"
+                "unknown conditional_disagg_policy: {s:?}, expected 'isl_bounding', 'prefill_load', 'isl_or_load', or 'cache_or_load'"
             )),
         }
     }
@@ -670,6 +689,10 @@ struct KvRouterConfigSerde {
     router_tracking_key_file: Option<PathBuf>,
     router_tracking_key_id: Option<String>,
     router_prefill_load_model: RouterPrefillLoadModel,
+    #[serde(default)]
+    router_prefill_linear_tok_per_s: Option<f64>,
+    #[serde(default)]
+    conditional_disagg_target_ttft_ms: Option<f64>,
     #[serde(rename = "router_snapshot_threshold")]
     _legacy_router_snapshot_threshold: Option<u32>,
     #[serde(rename = "router_reset_states")]
@@ -694,6 +717,10 @@ struct KvRouterConfigSerde {
     conditional_disagg_prefill_busy_threshold: Option<f64>,
     #[serde(default)]
     conditional_disagg_decode_busy_threshold: Option<f64>,
+    #[serde(default)]
+    conditional_disagg_busy_max_net_new: Option<usize>,
+    #[serde(default)]
+    conditional_disagg_cold_decode_budget: Option<usize>,
 }
 
 impl Default for KvRouterConfigSerde {
@@ -719,6 +746,8 @@ impl Default for KvRouterConfigSerde {
             router_tracking_key_file: config.router_tracking_key_file,
             router_tracking_key_id: config.router_tracking_key_id,
             router_prefill_load_model: config.router_prefill_load_model,
+            router_prefill_linear_tok_per_s: config.router_prefill_linear_tok_per_s,
+            conditional_disagg_target_ttft_ms: config.conditional_disagg_target_ttft_ms,
             _legacy_router_snapshot_threshold: None,
             _legacy_router_reset_states: false,
             router_ttl_secs: config.router_ttl_secs,
@@ -741,6 +770,8 @@ impl Default for KvRouterConfigSerde {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: config
                 .conditional_disagg_decode_busy_threshold,
+            conditional_disagg_busy_max_net_new: config.conditional_disagg_busy_max_net_new,
+            conditional_disagg_cold_decode_budget: config.conditional_disagg_cold_decode_budget,
         }
     }
 }
@@ -814,6 +845,19 @@ pub struct KvRouterConfig {
 
     /// Optional model for estimating effective prompt-side prefill load over time.
     pub router_prefill_load_model: RouterPrefillLoadModel,
+
+    /// Target time-to-first-token budget in milliseconds for the conditional-disagg prefill gate.
+    /// When set (together with `router_prefill_linear_tok_per_s`), the prefill-busy probe compares
+    /// the PREDICTED QUEUE WAIT against this budget instead of comparing occupancy against
+    /// `conditional_disagg_prefill_busy_threshold`. A wait in milliseconds is a quantity an
+    /// operator can state as an SLO; a fraction of capacity is not.
+    pub conditional_disagg_target_ttft_ms: Option<f64>,
+
+    /// Prefill throughput in tokens/second for `RouterPrefillLoadModel::Linear`. Ignored by the
+    /// other models. `None` with `Linear` selected is a configuration error, caught in `validate`:
+    /// there is no safe default, because the rate is a measured property of the model, the
+    /// parallelism layout and the batch size.
+    pub router_prefill_linear_tok_per_s: Option<f64>,
 
     /// TTL for blocks in seconds (only used when use_kv_events is false, default: 120.0)
     pub router_ttl_secs: f64,
@@ -930,6 +974,23 @@ pub struct KvRouterConfig {
     /// the guard is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditional_disagg_decode_busy_threshold: Option<f64>,
+
+    /// Local patch (dsv41-flash-b300-cost, opencode spike task): when set, the
+    /// `cache_or_load` load arm (prefill busy -> prefill locally on decode) only
+    /// bypasses requests whose net-new tokens on the chosen decode worker are below
+    /// this many tokens. Follow-up turns whose history decode already holds skip the
+    /// prefill queue cheaply; cold prompts (a burst of new sessions) stay on prefill
+    /// instead of landing as 100k-token prefills on decode. Unset = unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_disagg_busy_max_net_new: Option<usize>,
+
+    /// Local patch (opencode spike task): with `busy_max_net_new` set, a request
+    /// over the cap may still prefill locally on decode while the chosen decode
+    /// rank's router-tracked in-flight prefill tokens plus this request's net-new
+    /// tokens stay within this many tokens -- decode absorbs a bounded share of a
+    /// cold burst instead of none. Unset = no cold request bypasses under the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_disagg_cold_decode_budget: Option<usize>,
 }
 
 fn default_conditional_disagg_eff_isl_threshold() -> usize {
@@ -968,6 +1029,8 @@ impl Default for KvRouterConfig {
             router_tracking_key_file: None,
             router_tracking_key_id: None,
             router_prefill_load_model: RouterPrefillLoadModel::default(),
+            router_prefill_linear_tok_per_s: None,
+            conditional_disagg_target_ttft_ms: None,
             router_ttl_secs: 120.0,
             router_approximate_cache_policy: ApproximateCachePolicyKind::default(),
             router_queue_threshold: None,
@@ -991,6 +1054,8 @@ impl Default for KvRouterConfig {
                 default_conditional_disagg_eff_isl_ratio_threshold(),
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
+            conditional_disagg_busy_max_net_new: None,
+            conditional_disagg_cold_decode_budget: None,
         }
     }
 }
@@ -1032,6 +1097,8 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_tracking_key_file: compat.router_tracking_key_file,
             router_tracking_key_id: compat.router_tracking_key_id,
             router_prefill_load_model: compat.router_prefill_load_model,
+            router_prefill_linear_tok_per_s: compat.router_prefill_linear_tok_per_s,
+            conditional_disagg_target_ttft_ms: compat.conditional_disagg_target_ttft_ms,
             router_ttl_secs: compat.router_ttl_secs,
             router_approximate_cache_policy: ApproximateCachePolicyKind::default(),
             router_queue_threshold: compat.router_queue_threshold,
@@ -1057,6 +1124,8 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: compat
                 .conditional_disagg_decode_busy_threshold,
+            conditional_disagg_busy_max_net_new: compat.conditional_disagg_busy_max_net_new,
+            conditional_disagg_cold_decode_budget: compat.conditional_disagg_cold_decode_budget,
         };
         config.validate()?;
         Ok(config)
@@ -1079,6 +1148,41 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
             "router_prefill_load_model requires router_track_prefill_tokens=true".to_string(),
         );
     }
+    if let Some(budget) = config.conditional_disagg_target_ttft_ms {
+        if !budget.is_finite() || budget <= 0.0 {
+            return Err(format!(
+                "conditional_disagg_target_ttft_ms must be finite and > 0, got {budget}"
+            ));
+        }
+        if config.router_prefill_linear_tok_per_s.is_none() {
+            return Err(
+                "conditional_disagg_target_ttft_ms requires router_prefill_linear_tok_per_s to \
+                 convert the prefill backlog into a predicted wait"
+                    .to_string(),
+            );
+        }
+    }
+    if matches!(
+        config.router_prefill_load_model,
+        RouterPrefillLoadModel::Linear
+    ) {
+        match config.router_prefill_linear_tok_per_s {
+            None => {
+                return Err(
+                    "router_prefill_load_model='linear' requires router_prefill_linear_tok_per_s \
+                     (measure it: differentiate the router's active_prefill_tokens gauge under \
+                     saturated load)"
+                        .to_string(),
+                );
+            }
+            Some(rate) if !rate.is_finite() || rate <= 0.0 => {
+                return Err(format!(
+                    "router_prefill_linear_tok_per_s must be finite and > 0, got {rate}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     if config.use_remote_indexer && config.serve_indexer {
         return Err("use_remote_indexer and serve_indexer are mutually exclusive".to_string());
     }
@@ -1099,7 +1203,9 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
     if config.conditional_disagg_enabled
         && matches!(
             config.conditional_disagg_policy,
-            ConditionalDisaggPolicyKind::PrefillLoad | ConditionalDisaggPolicyKind::IslOrLoad,
+            ConditionalDisaggPolicyKind::PrefillLoad
+                | ConditionalDisaggPolicyKind::IslOrLoad
+                | ConditionalDisaggPolicyKind::CacheOrLoad,
         )
     {
         match (
@@ -1752,7 +1858,7 @@ mod tests {
 
         let error =
             try_config_from_values(&[("DYN_ROUTER_PREFILL_LOAD_MODEL", "fast")]).unwrap_err();
-        assert!(error.contains("expected 'none' or 'aic'"));
+        assert!(error.contains("expected 'none', 'aic' or 'linear'"));
 
         assert!(serde_json::to_string(&config_from_values(&[])).is_ok());
     }
@@ -2230,6 +2336,8 @@ worker_selection:
             "conditional_disagg_eff_isl_ratio_threshold",
             "conditional_disagg_prefill_busy_threshold",
             "conditional_disagg_decode_busy_threshold",
+            "conditional_disagg_busy_max_net_new",
+            "conditional_disagg_cold_decode_budget",
         ] {
             assert!(value.get(post_v1_3_field).is_none(), "{post_v1_3_field}");
         }

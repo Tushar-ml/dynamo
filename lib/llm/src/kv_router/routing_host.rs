@@ -289,6 +289,8 @@ pub(crate) struct RoutePlanSignals {
     pub(crate) cached_tokens: usize,
     pub(crate) potential_decode_blocks: u64,
     pub(crate) total_kv_blocks: Option<u64>,
+    /// Router-tracked in-flight prefill tokens on the selected worker (local patch).
+    pub(crate) active_prefill_tokens: Option<usize>,
 }
 
 impl RoutePreview {
