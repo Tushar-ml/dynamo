@@ -666,6 +666,43 @@ mod tests {
 mod advisory_worker_load_slo_tests {
     use super::AdvisoryWorkerLoad;
 
+    /// The rate is PER DP RANK, and handing it an aggregate under-predicts by the rank count.
+    ///
+    /// This is not hypothetical: it was configured wrong on a real run and caught only because the
+    /// trip point was compared against a per-rank gauge before the replay produced numbers. On
+    /// dsv41-flash/8xB300 with 4 prefill DP ranks the measured AGGREGATE drain is ~175k tok/s and
+    /// the aggregate backlog at congestion ~3.75M tokens. Per rank that is ~43.75k tok/s and
+    /// ~937k tokens. Both pairs give the same ~21 s residence; mixing them does not.
+    #[test]
+    fn aggregate_rate_against_per_rank_depth_underpredicts_by_the_rank_count() {
+        const RANKS: f64 = 4.0;
+        const AGGREGATE_RATE: f64 = 175_000.0;
+        const PER_RANK_RATE: f64 = AGGREGATE_RATE / RANKS;
+        const PER_RANK_DEPTH: usize = 937_000;
+
+        let per_rank = load(PER_RANK_DEPTH);
+
+        // Correct pairing: per-rank depth over per-rank rate is the true residence, ~21 s.
+        let truth = per_rank.prefill_wait_ms(PER_RANK_RATE).unwrap();
+        assert!(
+            (truth - 21_417.0).abs() < 50.0,
+            "per-rank depth / per-rank rate should be ~21.4 s, got {truth} ms"
+        );
+
+        // The trap: the same depth against the AGGREGATE rate reads ~5.4 s -- exactly 1/RANKS of
+        // the truth -- so a 10 s budget silently behaves like a 40 s one.
+        let wrong = per_rank.prefill_wait_ms(AGGREGATE_RATE).unwrap();
+        assert!(
+            (wrong * RANKS - truth).abs() < 1.0,
+            "aggregate rate must under-predict by exactly the rank count: {wrong} * {RANKS} != {truth}"
+        );
+
+        // And the consequence that matters: at a 10 s budget the correct rate trips and the
+        // aggregate one does not.
+        assert!(per_rank.prefill_wait_exceeds(10_000.0, PER_RANK_RATE).unwrap());
+        assert!(!per_rank.prefill_wait_exceeds(10_000.0, AGGREGATE_RATE).unwrap());
+    }
+
     fn load(active_prefill_tokens: usize) -> AdvisoryWorkerLoad {
         AdvisoryWorkerLoad {
             active_prefill_tokens,

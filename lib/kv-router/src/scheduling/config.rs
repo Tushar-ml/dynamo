@@ -853,10 +853,26 @@ pub struct KvRouterConfig {
     /// operator can state as an SLO; a fraction of capacity is not.
     pub conditional_disagg_target_ttft_ms: Option<f64>,
 
-    /// Prefill throughput in tokens/second for `RouterPrefillLoadModel::Linear`. Ignored by the
-    /// other models. `None` with `Linear` selected is a configuration error, caught in `validate`:
-    /// there is no safe default, because the rate is a measured property of the model, the
-    /// parallelism layout and the batch size.
+    /// Prefill throughput in tokens/second, **PER DATA-PARALLEL RANK**.
+    ///
+    /// The per-rank qualifier is the whole contract and it is easy to get wrong, so state it
+    /// plainly: the SLO gate divides ONE rank's `active_prefill_tokens` by this rate, because
+    /// `SchedulingRequest::worker_load_for` is keyed by `WorkerWithDpRank` and each DP rank drains
+    /// its own queue independently. Hand it an aggregate drain rate measured across N ranks and
+    /// every predicted wait is N times too small, so a stated budget behaves like N x the budget
+    /// and the gate quietly under-fires. Nothing detects this: both numbers are plausible, and
+    /// depth/rate measured as a consistent aggregate PAIR gives the right residence -- it is only
+    /// mixing a per-rank depth with an aggregate rate that breaks.
+    ///
+    /// Measuring tip: a tool that sums a per-rank gauge across ranks before differencing it (the
+    /// natural way to write one) yields the AGGREGATE. Divide by the rank count before configuring
+    /// this. The startup log prints the resulting trip point in tokens so it can be compared
+    /// against the per-rank gauge directly.
+    ///
+    /// Also used by `RouterPrefillLoadModel::Linear`; ignored by the other models. `None` with
+    /// `Linear` selected is a configuration error, caught in `validate`: there is no safe default,
+    /// because the rate is a measured property of the model, the parallelism layout and the batch
+    /// size.
     pub router_prefill_linear_tok_per_s: Option<f64>,
 
     /// TTL for blocks in seconds (only used when use_kv_events is false, default: 120.0)
@@ -1234,8 +1250,9 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
                         ?config.conditional_disagg_prefill_busy_threshold,
                     "conditional_disagg prefill-load condition is the SLO gate: bypass when the \
                      selected prefill worker's predicted queue wait (active_prefill_tokens / \
-                     tokens_per_second) exceeds the TTFT budget. prefill_busy_threshold is INERT \
-                     while this is set"
+                     tokens_per_second) exceeds the TTFT budget. The rate is PER DATA-PARALLEL \
+                     RANK and so is the trip point -- compare it against ONE rank's gauge, not the \
+                     sum. prefill_busy_threshold is INERT while this is set"
                 );
             }
             _ => {}
