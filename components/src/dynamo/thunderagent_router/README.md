@@ -2,163 +2,16 @@
 
 > **Experimental — not a released component.** Run it from a source checkout
 > (see [Install](#install)), not from a `pip install ai-dynamo`. The CLI
-> flags, the `nvext.agent_context` schema, and the lifecycle hooks are all
-> unstable and will change.
+> flags, session headers, and the lifecycle hooks are all unstable and will
+> change.
 
-A standalone Dynamo router that schedules at the granularity of an agent run
-— the whole `LLM turn → tool call → next turn` loop — instead of individual
-requests. It wraps Dynamo's native KV router and adds tool-boundary
-pause/resume, porting the scheduler from the ThunderAgent paper.
+A standalone Dynamo router that schedules at the granularity of an agent run —
+the whole `LLM turn → tool call → next turn` loop — instead of individual
+requests. It wraps Dynamo's native KV router and adds a program-level scheduler
+with tool-boundary pause/resume, porting the scheduler from the ThunderAgent
+paper.
 
-## The problem
-
-Agentic workloads (SWE-bench, browser-use, anything with a tool loop) make
-many short LLM calls separated by non-GPU work: `docker exec`, `pytest`,
-`curl`, waiting on a subagent. Between turns the agent's KV cache stays
-resident, holding blocks while doing nothing. A request-level router
-(vLLM's, SGLang's, Dynamo's stock `KvRouter`) sees each turn but not the
-agent behind it, which costs you two ways:
-
-- **Cache-occupancy blowup.** With N agents at step K, the working set is
-  `N × step_K_context`, most of it idle between turns. The engine evicts
-  useful blocks under pressure or refuses admission, and every next turn
-  pays a re-prefill tax.
-- **No tool-boundary backpressure.** The router can't defer a hot trajectory
-  at a natural pause point — it can only cancel in-flight requests or queue
-  them, both worse than waiting until the agent is between turns.
-
-## The scheduler
-
-The algorithm comes from [ThunderAgent](https://arxiv.org/abs/2602.13692)
-(Kang et al., 2026). It groups requests by `program_id` and runs an outer
-scheduler that moves each program through `(REASONING | ACTING) × (ACTIVE |
-PAUSED)`. A program enters ACTING at a tool boundary. Under memory pressure
-the scheduler pauses ACTING programs — logically, with no decode preemption —
-so the engine is free to evict their KV. When utilization drops it resumes
-the smallest-token programs first, BFD-packing them back under threshold. The
-payoff is working-set accounting that counts programs rather than requests,
-plus pause/resume aimed at tool boundaries rather than arbitrary tokens.
-
-## What this port changes
-
-The scheduler is upstream's, unchanged: same lifecycle, same "pause smallest
-ACTING first" selection, same BFD restore, same `2^(-t/τ)` decay on the
-resume side, same per-backend capacity bookkeeping. The knobs in the table
-below expose upstream's values as flags; none are new mechanisms.
-
-Two things differ from the reference implementation:
-
-- **In-path Dynamo service, not a proxy.** Upstream ships a Python OpenAI
-  proxy in front of the engine. This runs as a Dynamo router that owns a
-  `KvRouter` directly and registers as a model handler, so there's no extra
-  proxy hop.
-- **Real token counts.** Running in-path, it reads `prompt_tokens +
-  completion_tokens` off each response. The upstream proxy only sees raw
-  bytes, so it estimates from `len(json.dumps(payload)) / chars_per_token`.
-
-v0 is a single in-memory service, so pause state is lost on restart. A Rust
-port and the larger deviations from upstream — blended load/overlap worker
-selection, workflow-profile-aware pause selection, KV demote/prefetch — are
-future work, not part of this version.
-
-### Knobs
-
-| Flag | Env var | Default | Description |
-|---|---|---|---|
-| `--endpoint` | `DYN_ROUTER_ENDPOINT` | – | Worker endpoint (e.g. `dynamo.vllm.generate`) |
-| `--router-block-size` | `DYN_ROUTER_BLOCK_SIZE` | 128 | KV cache block size |
-| `--pause-threshold` | `DYN_THUNDERAGENT_PAUSE_THRESHOLD` | 0.95 | Working-set fraction of KV pool that fires a pause cycle. |
-| `--pause-target` | `DYN_THUNDERAGENT_PAUSE_TARGET` | 0.80 | Setpoint that pause cycles drive util back down to. |
-| `--soft-demote-threshold` | `DYN_THUNDERAGENT_SOFT_DEMOTE_THRESHOLD` | 0.80 | Soft-demote band start (negative priority jump in `[soft, pause)`). |
-| `--soft-demote-priority-jump` | `DYN_THUNDERAGENT_SOFT_DEMOTE_PRIORITY_JUMP` | -2.0 | Priority seconds applied to soft-demoted programs. |
-| `--resume-priority-boost` | `DYN_THUNDERAGENT_RESUME_PRIORITY_BOOST` | 1.0 | Priority seconds added to a request that just resumed. |
-| `--resume-timeout-seconds` | `DYN_THUNDERAGENT_RESUME_TIMEOUT_SECONDS` | 1800.0 | Forced-resume cap. Mirrors ThunderAgent's `_wait_for_resume`. |
-| `--resume-hysteresis` | `DYN_THUNDERAGENT_RESUME_HYSTERESIS` | 0.10 | Headroom below `pause_threshold` required before any resume. |
-| `--acting-token-weight` | `DYN_THUNDERAGENT_ACTING_TOKEN_WEIGHT` | 1.0 | Multiplier on `token_total` for ACTING programs in the **pause-side** working set. |
-| `--acting-decay-tau-seconds` | `DYN_THUNDERAGENT_ACTING_DECAY_TAU_SECONDS` | 1.0 | Tau for exponential decay of ACTING tokens in the **resume-side** working set. |
-| `--scheduler-interval-seconds` | `DYN_THUNDERAGENT_SCHEDULER_INTERVAL_SECONDS` | 5.0 | Scheduler tick period. |
-| `--model-name` | `DYN_THUNDERAGENT_MODEL_NAME` | – | Frontend-visible model name. Triggers `register_model`. |
-| `--model-path` | `DYN_THUNDERAGENT_MODEL_PATH` | – | Path or HF repo ID for tokenizer + model card. |
-| `--dyn-tool-call-parser` | `DYN_TOOL_CALL_PARSER` | – | Tool-call parser forwarded to `register_model` (same value as the worker's). Translates model-native tool calls into OpenAI `tool_calls`. Applies only with `--model-name`. |
-| `--dyn-reasoning-parser` | `DYN_REASONING_PARSER` | – | Reasoning parser forwarded to `register_model`, mirroring the worker's flag. Applies only with `--model-name`. |
-
-All `KvRouter` flags from `dynamo.router` (`--router-temperature`,
-`--use-kv-events`, `--router-track-output-blocks`, …) are also accepted
-and forwarded.
-
----
-
-## Roadmap
-
-Roughly in priority order:
-
-1. **Blended worker selection.** Admission currently picks the
-   lightest-loaded worker. Configure `KvRouter` with
-   `overlap_score_weight ∈ (0, 1)` so selection blends load and prefix
-   overlap.
-2. **Workflow-profile-aware pause selection.** Profile per-session-type
-   tool-gap distributions and prefer pausing programs whose predicted
-   idle exceeds the resume cost.
-3. **Rust port of the hot path.** Per-response-chunk `Python::with_gil`
-   + `pythonize` cost is real at 128-concurrency.
-4. **Stronger correctness coverage.** Multi-worker resume placement,
-   restart durability of pause state, and `routing.backend_instance_id`
-   honouring need per-request log assertions before this package leaves
-   `experimental`.
-
----
-
-## Tracing
-
-Enable agent tracing on the frontend with the master switch
-`DYN_AGENT_TRACE=1`. That turns on sane defaults: the `jsonl_gz` sink at
-`/tmp/dynamo-agent-trace`, the tool-events ZMQ socket bound at
-`tcp://127.0.0.1:20390`, and replay hashes. Override any of them with
-`DYN_AGENT_TRACE_SINKS` (e.g. `jsonl`, `stderr`),
-`DYN_AGENT_TRACE_OUTPUT_PATH`, and `DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT`.
-
-Every LLM call then lands a `request_end` record carrying `trajectory_id`,
-`session_id`, `input_tokens`, `output_tokens`, `cached_tokens`,
-`request_received_ms`, `total_time_ms`, and the block-level
-`input_sequence_hashes` — enough for offline replay against this router.
-Dynamo owns the ZMQ bind side, so point your harness's tool-event publisher
-at that endpoint (producers connect) and `tool_start` / `tool_end` /
-`tool_error` events arrive with the same `trajectory_id` and matching
-`tool_call_id` pairs, giving you the full LLM-turn ↔ tool-gap timeline per
-agent.
-
----
-
-## Architecture
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│ dynamo.frontend  (HTTP + auth + tracing sink)               │
-└────────────────────┬────────────────────────────────────────┘
-                     │  chat completions, with nvext.agent_context
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ dynamo.thunderagent_router  (this service)                  │
-│  - ProgramTable: trajectory_id → ProgramState               │
-│  - admission gate: before_request → was_paused?             │
-│  - scheduler loop (every scheduler_interval_seconds):       │
-│      _apply_soft_demotes → _pause_until_safe → _greedy_resume│
-│  - sticky worker pin from program.assigned_worker_id        │
-│  - after_request: real-token accounting                     │
-└────────────────────┬────────────────────────────────────────┘
-                     │  KvRouter.generate
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ KvRouter  (in-process; subscribes to KV events + FPM)       │
-└────────────────────┬────────────────────────────────────────┘
-                     │  per-worker dispatch
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ dynamo.vllm  (N workers; FPM publisher, KV events publisher)│
-└─────────────────────────────────────────────────────────────┘
-```
-
----
+**Conceptual docs live in [docs/agents/thunderagent-router.md](../../../../docs/fern/pages/use-cases/agents/thunderagent-program-scheduler.md)** — the scheduler model, tool-boundary pause/resume semantics, the utilization-driven control loop, and observability. This README contains the source build and the complete Harbor/Pi A/B walkthrough.
 
 ## Install
 
@@ -183,6 +36,7 @@ uv pip install -e .
 # 1. Start your Dynamo workers (vLLM example, with KV events on)
 python -m dynamo.vllm \
     --model <model> --tensor-parallel-size <N> \
+    --endpoint-types none \
     --kv-events-config '{"publisher":"zmq","topic":"kv-events",
                          "endpoint":"tcp://*:20080",
                          "enable_kv_cache_events":true}'
@@ -191,104 +45,196 @@ python -m dynamo.vllm \
 python -m dynamo.thunderagent_router \
     --endpoint dynamo.backend.generate \
     --model-name <model> \
-    --router-block-size 16 \
-    --router-reset-states
+    --router-block-size 16
 
 # 3. Start the frontend (any router mode -- the frontend just needs to find
 #    a model handler, which our service registered)
-python -m dynamo.frontend --router-mode round-robin --router-reset-states
+python -m dynamo.frontend --router-mode round-robin
 ```
+
+Use `--endpoint-types none` on workers wrapped by ThunderAgent so they register
+only for topology and readiness. ThunderAgent registers the public
+chat/completions surface; if the wrapped backend also advertises that surface
+for the same model, the frontend may route requests directly to the backend and
+bypass ThunderAgent lifecycle handling such as `x-dynamo-session-final`.
+
+For clients that require SGLang's native `/generate` API, add
+`--publish-sglang-generate` to ThunderAgent. This advertises the existing
+SGLang-native frontend route through ThunderAgent while the wrapped worker
+continues to use `--endpoint-types none`. This option requires `--model-name`
+so ThunderAgent can register the native capability for that model.
+
+The control-loop knobs (`--pause-threshold`, `--pause-target`,
+`--resume-hysteresis`, `--scheduler-interval-seconds`, …) and their defaults are
+documented in [docs/agents/thunderagent-router.md](../../../../docs/fern/pages/use-cases/agents/thunderagent-program-scheduler.md#utilization-driven-control-loop).
+All `KvRouter` flags from `dynamo.router` (`--router-temperature`,
+`--use-kv-events`, `--router-track-output-blocks`, …) are also accepted and
+forwarded.
 
 ### Sending requests
 
-The router expects `nvext.agent_context.trajectory_id` (and optionally
-`session_id`, `session_type_id`) on each chat-completions request so it
-can group turns under the same program. The
-[ishandhanani/ThunderAgent](https://github.com/ishandhanani/ThunderAgent)
-fork of `mini-swe-agent` injects these directly via OpenAI client
-`extra_body`; any other harness can do the same.
+The router expects header-derived `session_id` on each chat-completions
+request so it can group turns under the same program. Custom harnesses can send
+`x-dynamo-session-id` and, for subagents, `x-dynamo-parent-session-id`.
 
-```json
-{
-  "model": "MiniMaxAI/MiniMax-M2",
-  "messages": [...],
-  "stream": true,
-  "nvext": {
-    "agent_context": {
-      "trajectory_id": "astropy__astropy-14365",
-      "session_id":    "mswea-...",
-      "session_type_id": "swebench-lite"
-    }
-  }
-}
-```
+Requests without session identity are passed through as one-off (no program
+admission, no pause/resume). This is the safe fallback for non-agentic traffic
+sharing the same workers.
 
-Requests without `agent_context` are passed through as one-off (no
-program admission, no pause/resume). This is the safe fallback for
-non-agentic traffic sharing the same workers.
+Admission is a transaction. A request cancelled while it is queued for capacity
+— a client disconnect, for instance — leaves the program table as it found it:
+a program the admission attempt created is removed, and one that already existed
+keeps the session history of its previous turn. Cancelled requests therefore do
+not hold capacity, and do not queue other programs behind them.
 
----
+### SGLang HiCache retention budget
 
-## Reproducing the MiniMax-M2 results
+`dynamo.sglang` publishes the authoritative GPU KV and HiCache host capacities in each worker's model deployment card. The scheduler automatically uses their sum as its retention budget, so `--pause-threshold 0.95` means 95% of the combined GPU + host pool; there is no ThunderAgent HiCache flag to set. This lets SGLang spill from GPU to its native host tier before ThunderAgent starts holding programs at tool boundaries.
 
-The headline numbers — program-aware scheduling vs KV-routing-only on the
-same hardware — come from driving SWE-bench-Lite through pi via a Harbor
-adapter, against two TP4 MiniMax-M2 replicas on a single 8×H100 node.
+Mooncake capacity is deliberately excluded. It is a content-addressed storage tier whose contents may be evicted or may not match the next request, not an unconditional program-retention budget. ThunderAgent does not call HiCache eviction, restore, prefetch, or Mooncake APIs; SGLang remains the admission and materialization authority.
 
-### 1. Bring up Dynamo (2× TP4 MiniMax-M2)
+## Tracing
 
-One script brings up both TP4 workers, the program-aware router, and the
-frontend on `:8100`:
+Enable request tracing on the frontend with the master switch
+`DYN_REQUEST_TRACE=1`. That turns on sane defaults: the `jsonl_gz` sink at
+`/tmp/dynamo-request-trace` and replay hashes. Bind the optional tool-events ZMQ
+socket with `DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT` when the harness
+publishes explicit tool spans. Override sink behavior with
+`DYN_REQUEST_TRACE_SINKS` (e.g. `jsonl`, `stderr`) and
+`DYN_REQUEST_TRACE_OUTPUT_PATH`.
+See [Agent Tracing](../../../../docs/fern/pages/use-cases/agents/agent-tracing.md) for the record schema.
 
-```bash
-bash components/src/dynamo/thunderagent_router/run_minimax_8xh100.sh
-```
+Every LLM call then lands a `request_end` record carrying `session_id`,
+`input_tokens`, `output_tokens`, `cached_tokens`,
+`request_received_ms`, `total_time_ms`, and the block-level
+`input_sequence_hashes` — enough for offline replay against this router.
+Dynamo owns the ZMQ bind side, so point your harness's tool-event publisher
+at that endpoint (producers connect) and `tool_start` / `tool_end` /
+`tool_error` events arrive with the same `session_id` and matching
+`tool_call_id` pairs, giving you the full LLM-turn ↔ tool-gap timeline per
+agent.
 
-First launch JIT-warms the FP8 kernels — wait for `curl localhost:8100/v1/models`
-to list the model before starting the client.
+## Harbor/Pi A/B walkthrough
 
-For the **KV-routing-only baseline** arm, drop the `thunderagent_router` line
-from the script and run the frontend in KV-router mode against the same two
-workers (`--router-mode kv`).
+This walkthrough runs the same SWE-bench Verified task through ThunderAgent and the stock Dynamo KV router. Harbor owns the task container, Pi runs inside it, and the model stack runs on the host. ThunderAgent is backend-agnostic and works with Dynamo's vLLM and SGLang backends; this example uses one 8-GPU node and two TP4 vLLM workers loading `MiniMaxAI/MiniMax-M2.7` from Hugging Face and serving the API alias `MiniMaxAI/MiniMax-M2`. There is no HiCache, Mooncake, shared cache, or frontend admission control in either arm.
 
-### 2. Run pi + Harbor
+The [agent-plugins `DynamoPi` adapter](https://github.com/ai-dynamo/agent-plugins/blob/main/pi-plugin/harbor/dynamo_pi.py) is required. It installs the Dynamo provider in each Harbor task container and maps Harbor's per-trial ID to one stable `x-dynamo-session-id` across all Pi turns. The ThunderAgent arm also sends one terminal session request so the router can release the completed program; the stock KV arm disables that request because it has no lifecycle consumer.
 
-The Harbor pi adapter lives on the `feat/harbor-pi-adapter` branch of the
-fork. It installs `pi-dynamo-provider` into each trial container and injects
-`nvext.agent_context` so each Harbor trial maps to one ThunderAgent program.
+### 1. Install the three source trees
+
+Use Python 3.12 and a machine with Docker and eight visible GPUs. Build Dynamo from source rather than installing a released wheel. Pi and its Node.js runtime are installed inside each Harbor task container.
 
 ```bash
-# Clone the fork and the provider side by side.
-git clone -b feat/harbor-pi-adapter https://github.com/ishandhanani/ThunderAgent
-git clone https://github.com/ai-dynamo/pi-dynamo-provider
-export PI_DYNAMO_PROVIDER_PATH="$PWD/pi-dynamo-provider"
+git clone https://github.com/ai-dynamo/dynamo ~/src/dynamo
 
-cd ThunderAgent/examples/datagen/harbor
-uv venv && source .venv/bin/activate && uv pip install -e .
+git clone --branch v0.16.0 --depth 1 https://github.com/harbor-framework/harbor ~/src/harbor
+git clone https://github.com/ai-dynamo/agent-plugins ~/src/agent-plugins
+git -C ~/src/agent-plugins checkout 223a0b8823610d042e7479bfff9b93eeac4a23ec
+
+cd ~/src/dynamo
+uv venv --python 3.12 --seed .venv
+source .venv/bin/activate
+uv pip install pip 'maturin[patchelf]'
+(cd lib/bindings/python && maturin develop --uv)
+uv pip install -e '.[vllm]'
+
+cd ~/src/harbor
+uv sync
+```
+
+These commands were validated with Harbor `0.16.0` and Pi `0.72.1`. Record the Dynamo, Harbor, and agent-plugins revisions with benchmark artifacts.
+
+### 2. Launch ThunderAgent or stock KV
+
+Choose one arm. The launcher starts both TP4 workers and the matching router, then prints readiness after both workers and the public model register.
+
+```bash
+cd ~/src/dynamo
+source .venv/bin/activate
+export HF_HOME=/home/nvidia/hf_cache
+
+# ThunderAgent
+export ARM=ta
+
+# Stock KV instead
+# export ARM=kv
+
+./components/src/dynamo/thunderagent_router/run_minimax_8xh100.sh "$ARM"
+```
+
+Stop the launcher with `Ctrl-C` before starting the other arm. Always use fresh server processes for each arm.
+
+### 3. Run one Verified task
+
+In a second terminal, set `ARM` and `DYN_AGENT_SESSION_FINAL` to match the launched stack. Use a host address reachable from Docker rather than `127.0.0.1`.
+
+```bash
+cd ~/src/harbor
+source .venv/bin/activate
+
+# ThunderAgent
+export ARM=ta
+export DYN_AGENT_SESSION_FINAL=1
+
+# Stock KV instead
+# export ARM=kv
+# export DYN_AGENT_SESSION_FINAL=0
+
+export PI_PLUGIN_DIR=~/src/agent-plugins/pi-plugin
+export PYTHONPATH=$PI_PLUGIN_DIR/harbor
+export DYNAMO_BASE_URL=http://$(ip route get 1.1.1.1 | awk '{print $7; exit}'):8100/v1
+curl -fsS "$DYNAMO_BASE_URL/models"
 
 harbor run \
-  --path datasets/swebench \
-  --agent pi \
-  --model 'dynamo/MiniMaxAI/MiniMax-M2' \
-  --ak api_base='http://127.0.0.1:8100/v1' \
-  --n-tasks 30 --n-concurrent 10 \
-  --network-mode host --override-cpus 2 --override-memory-mb 8192 \
-  -v "$PI_DYNAMO_PROVIDER_PATH:/opt/pi-dynamo-provider:ro" \
-  --jobs-dir /tmp/harbor-jobs --job-name ta-run --quiet
+  -d swebench-verified@1.0 -i astropy__astropy-12907 \
+  -a dynamo_pi:DynamoPi -m dynamo/MiniMaxAI/MiniMax-M2 \
+  --ak version=0.72.1 --ae "DYNAMO_BASE_URL=$DYNAMO_BASE_URL" \
+  --ae "DYN_AGENT_SESSION_FINAL=$DYN_AGENT_SESSION_FINAL" \
+  --mounts "[{\"type\":\"bind\",\"source\":\"$PI_PLUGIN_DIR\",\"target\":\"/opt/pi-dynamo-provider\",\"read_only\":true}]" \
+  -n 1 --agent-setup-timeout-multiplier 10 \
+  --job-name "$ARM-verified-one" -y
 ```
 
-### Expected
+No pause/resume lines are expected from a one-task smoke; those only appear after the working set reaches the configured thresholds.
 
-On 8×H100 with 30 SWE-bench-Lite tasks (20 astropy + 10 django) at
-`n_concurrent=10`, the Pi + Dynamo setup shows a **12-16% throughput
-improvement** from program-aware scheduling over the KV-routing-only baseline.
-Pass-rate deltas on this slice are within run-to-run noise.
+### 4. Run the full Verified dataset
 
-Pointing `--ak api_base` at a stock `vllm serve` instead of the Dynamo
-frontend also works — `nvext.agent_context` is silently dropped — which is how
-the non-Dynamo control arm is run.
+On a fresh host, authenticate with Docker Hub and prepare every task image outside the measured interval. Verified uses 500 unique images, which exceeds the anonymous pull limit. Keeping containers until the job finishes avoids hundreds of concurrent per-trial Compose teardowns; prune them once afterward.
 
----
+```bash
+docker login
+
+harbor run \
+  -d swebench-verified@1.0 \
+  -a nop \
+  --extra-docker-compose ~/src/agent-plugins/pi-plugin/harbor/host-network.yml \
+  -n 32 --n-concurrent-agents 32 \
+  --memory ignore \
+  --no-delete --environment-kwarg keep_containers=true \
+  --job-name verified-prepull --install-only -y
+
+docker container prune -f
+```
+
+The host-network overlay avoids creating one Docker bridge network per trial, which exhausts Docker's default address pools during the measured run.
+
+```bash
+harbor run \
+  -d swebench-verified@1.0 \
+  -a dynamo_pi:DynamoPi -m dynamo/MiniMaxAI/MiniMax-M2 \
+  --ak version=0.72.1 --ae "DYNAMO_BASE_URL=$DYNAMO_BASE_URL" \
+  --ae "DYN_AGENT_SESSION_FINAL=$DYN_AGENT_SESSION_FINAL" \
+  --mounts "[{\"type\":\"bind\",\"source\":\"$PI_PLUGIN_DIR\",\"target\":\"/opt/pi-dynamo-provider\",\"read_only\":true}]" \
+  --extra-docker-compose ~/src/agent-plugins/pi-plugin/harbor/host-network.yml \
+  -n 256 --n-concurrent-agents 256 \
+  --agent-setup-timeout-multiplier 10 --memory ignore \
+  --no-delete --environment-kwarg keep_containers=true \
+  --job-name "$ARM-verified-full" -y
+```
+
+This runs every task in `swebench-verified@1.0` with verification enabled. Remove the stopped task containers, start the other arm from fresh processes, set its matching `ARM` and `DYN_AGENT_SESSION_FINAL`, and rerun the same command.
+
+Stable session headers are sent in both arms. `DYN_AGENT_SESSION_FINAL=0` only prevents the stock KV arm from receiving ThunderAgent's terminal lifecycle request.
 
 ## Citation
 
@@ -309,8 +255,8 @@ ThunderAgent paper:
 
 ## References
 
+- Conceptual docs: [docs/agents/thunderagent-router.md](../../../../docs/fern/pages/use-cases/agents/thunderagent-program-scheduler.md)
 - ThunderAgent paper: <https://arxiv.org/abs/2602.13692>
 - Upstream ThunderAgent reference: <https://github.com/HaoKang-Timmy/ThunderAgent>
-- Repro fork (mini-swe-agent + agent_context injector): <https://github.com/ishandhanani/ThunderAgent>
-- Dynamo KV router: [Router Guide](/docs/components/router/router-guide.md)
-- `nvext.agent_context` schema: [nvext reference](/docs/components/frontend/nvext.md#agent-context)
+- Pi Dynamo provider: <https://github.com/ai-dynamo/agent-plugins/tree/main/pi-plugin>
+- Dynamo KV router: [Router Guide](../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-guide.md)

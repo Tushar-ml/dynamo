@@ -12,7 +12,7 @@ The NVIDIA Dynamo project uses containerized development and deployment to maint
 
 ### Core Components
 
-- **`render.py`** - A render script used to generate Dockerfiles for AI inference frameworks (vLLM, TensorRT-LLM, SGLang) and the frontend image. The generated Dockerfile includes the needed multi-stage steps for development vs production configurations.
+- **`render.py`** - A render script used to generate Dockerfiles for AI inference frameworks (vLLM, TensorRT-LLM, SGLang, Triton Inference Server) and the frontend image. The generated Dockerfile includes the needed multi-stage steps for development vs production configurations.
 
 - **`run.sh`** - A container runtime manager that launches Docker containers with proper GPU access, volume mounts, and environment configurations. It supports different development workflows from root-based legacy setups to user-based development environments.
 
@@ -27,7 +27,7 @@ Below is a summary of the general file structure for the framework Dockerfile st
 | Stage/Filepath | Target |
 | --- | --- |
 | **STAGE dynamo_base** | **FROM ${BASE_IMAGE}** |
-| /bin/uv, /bin/uvx | COPY from ghcr.io/astral-sh/uv:latest (→ framework, runtime) |
+| /opt/uv/bin/uv, /opt/uv/bin/uvx | COPY from ghcr.io/astral-sh/uv:${uv_version}, prepended to PATH (→ framework, runtime) |
 |  /usr/bin/nats-server | Downloaded from GitHub (→ runtime) |
 |  /usr/local/bin/etcd/ | Downloaded from GitHub (→ runtime) |
 |  /usr/local/rustup/ | Installed via rustup-init (→ wheel_builder, dev) |
@@ -119,6 +119,13 @@ docker build -t dynamo:latest-vllm-runtime -f container/rendered.Dockerfile .
 
 # Run runtime container
 container/run.sh --image dynamo:latest-vllm-runtime -it
+```
+
+Intel XPU variant (SGLang only) — pass `--device=xpu` to both `render.py` and `run.sh`:
+```bash
+container/render.py --framework=sglang --device=xpu --target=runtime
+docker build -t dynamo:latest-sglang-xpu-runtime -f container/sglang-runtime-xpu-amd64-rendered.Dockerfile .
+container/run.sh --image dynamo:latest-sglang-xpu-runtime --device=xpu -it
 ```
 
 ### 2. test image (layers test deps on top of runtime):
@@ -238,7 +245,21 @@ docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -f cont
 # Build TensorRT-LLM runtime image called dynamo:latest-trtllm-runtime
 container/render.py --framework=trtllm --target=runtime --output-short-filename --cuda-version=13.1
 docker build -t dynamo:latest-trtllm-runtime -f container/rendered.Dockerfile .
+
+# Build SGLang runtime image for Intel XPU (instead of the default CUDA device)
+container/render.py --framework=sglang --device=xpu --target=runtime
+docker build -t dynamo:latest-sglang-xpu-runtime -f container/sglang-runtime-xpu-amd64-rendered.Dockerfile .
+
+# Build Triton runtime image (prebuilt Dynamo wheels from PyPI on the upstream
+# Triton release image). --network=host lets the build reach PyPI.
+# The Triton release is selected with --build-arg RUNTIME_IMAGE_TAG=<tag>
+# (defaults to 26.09-py3); pick any nvcr.io/nvidia/tritonserver:<tag>.
+container/render.py --framework=triton --target=runtime --output-short-filename
+docker build --network=host --build-arg RUNTIME_IMAGE_TAG=26.09-py3 -t dynamo:latest-triton-runtime -f container/rendered.Dockerfile .
 ```
+
+The `--device` flag selects the accelerator backend. It defaults to `cuda`; pass `--device=xpu`
+to produce an Intel XPU image (currently supported for `--framework=sglang`).
 
 After building, use `run.sh` to launch the container (see [run.sh - Container Runtime Manager](#runsh---container-runtime-manager) below for full options):
 ```bash
@@ -252,14 +273,7 @@ The frontend image is a specialized container that includes the Dynamo component
 
 **Build EPP Image**
 ```bash
-sudo apt-get update && sudo apt-get install -y git build-essential protobuf-compiler libclang-dev
-curl --retry 5 --retry-delay 3 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-. "$HOME/.cargo/env"
-cargo install cbindgen
-
-pushd deploy/inference-gateway/epp
-make all
-popd
+make -C deploy/inference-gateway/ext-proc all
 
 EPP_GIT_TAG=$(git describe --tags --dirty --always 2>/dev/null || echo "dev")
 EPP_IMAGE="dynamo/dynamo-epp:${EPP_GIT_TAG}"
@@ -270,12 +284,15 @@ EPP_IMAGE="dynamo/dynamo-epp:${EPP_GIT_TAG}"
 # Build the frontend image (automatically builds EPP image as a dependency)
 container/render.py --framework=dynamo --target=frontend --output-short-filename
 docker build -t dynamo:frontend --build-arg EPP_IMAGE=${EPP_IMAGE} -f container/rendered.Dockerfile .
+
+# NIXL comes from PyPI; override the release with --build-arg NIXL_REF=v1.4.0
 ```
 
+**Note on `EPP_IMAGE`**: it must be an image built from `deploy/inference-gateway/ext-proc/Dockerfile`, not an arbitrary EPP image. Beyond the `/epp` binary, the frontend's compliance stages read `/sbom-rust-epp.cdx.json` and `/rust-licenses` out of it, and only that Dockerfile places them there. Pointing `EPP_IMAGE` at an older release or a third-party EPP fails the build on the `COPY --from=epp` of those paths, with a message (`lstat /sbom-rust-epp.cdx.json: no such file or directory`) that mentions neither EPP nor SBOMs. CI is unaffected: it builds the EPP image in the same workflow and feeds that URI straight through.
+
 The build process automatically:
-1. Builds the Dynamo static library for EPP KV-aware routing
-2. Builds the custom EPP Docker image using `make all` from `deploy/inference-gateway/epp/Makefile`
-3. Builds the frontend image with the EPP binary and Dynamo runtime components
+1. Builds the native Rust EPP Docker image using `make all` from `deploy/inference-gateway/ext-proc/Makefile`
+2. Builds the frontend image with the EPP binary and Dynamo runtime components
 
 For more details, see [`deploy/inference-gateway/README.md`](../deploy/inference-gateway/README.md).
 
@@ -448,6 +465,49 @@ python -m dynamo.frontend &
 python -m dynamo.vllm --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.20 &
 ```
 
+**Intel XPU variant** (SGLang only) — pass `--device=xpu` so `run.sh` exposes `/dev/dri` and joins the host render group, then start the SGLang backend instead of vLLM:
+```bash
+# 1. Build SGLang local-dev image for Intel XPU
+container/render.py --framework=sglang --device=xpu --target=local-dev
+docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) \
+  -t dynamo:latest-sglang-xpu-local-dev \
+  -f container/sglang-local-dev-xpu-amd64-rendered.Dockerfile .
+
+# 2. Run development container with Intel GPU access + workspace mounted
+container/run.sh --image dynamo:latest-sglang-xpu-local-dev --device=xpu \
+  --mount-workspace -v $HOME/.cache:/home/dynamo/.cache -p 8000:8000 -it
+
+# From this point forward, commands run inside the container started in step 2.
+
+# 3. Editable install of dynamo into the SGLang conda env
+# (local-dev images intentionally skip the dynamo wheel install; see
+#  container/templates/dev.Dockerfile -> "The editable install must be done at runtime")
+# The conda env at /opt/miniforge3/envs/sglang is root-owned, so chown it once
+# to the dynamo user (the image grants NOPASSWD sudo) before installing.
+sudo chown -R dynamo:0 /opt/miniforge3/envs/sglang
+cargo build --locked --features dynamo-llm/block-manager --workspace
+# 3a. ai_dynamo_runtime (Rust bindings: dynamo._core)
+# Add `--features request-trace-s3` to enable the S3 request-trace sink
+# (DYN_REQUEST_TRACE_SINKS=s3); it is off by default to keep the local build lean.
+cd lib/bindings/python && maturin develop --uv && cd -
+# 3b. ai-dynamo (Python namespace packages: dynamo.frontend, dynamo.sglang, ...)
+uv pip install --no-deps -e /workspace
+# 3c. NIXL python bindings (C++ libs are already baked in at /opt/intel/intel_nixl;
+#     local-dev intentionally skips installing the wheel into the env)
+uv pip install --no-deps /opt/dynamo/wheelhouse/nixl/nixl*.whl
+
+# 4. Sanity check (optional but recommended)
+deploy/sanity_check.py
+
+# 5. Start infrastructure services (NATS for messaging, etcd for service discovery)
+nats-server -js &
+etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379 --data-dir /tmp/etcd &
+
+# 6. Run inference (frontend + SGLang XPU backend)
+python -m dynamo.frontend &
+python -m dynamo.sglang --model Qwen/Qwen3-0.6B --mem-fraction-static 0.20 &
+```
+
 ### Production Workflow
 ```bash
 # 1. Build production runtime image (runs as non-root dynamo user)
@@ -456,6 +516,17 @@ docker build -t dynamo:latest-vllm-runtime -f container/rendered.Dockerfile .
 
 # 2. Run production container as non-root dynamo user
 container/run.sh --image dynamo:latest-vllm-runtime --gpus all -v $HOME/.cache:/home/dynamo/.cache
+```
+
+**Intel XPU variant** (SGLang only) — replace `--gpus all` with `--device=xpu` so `run.sh` exposes `/dev/dri` and joins the host render group:
+```bash
+# 1. Build SGLang XPU runtime image
+container/render.py --framework=sglang --device=xpu --target=runtime
+docker build -t dynamo:latest-sglang-xpu-runtime -f container/sglang-runtime-xpu-amd64-rendered.Dockerfile .
+
+# 2. Run as dynamo user with Intel GPU access
+container/run.sh --image dynamo:latest-sglang-xpu-runtime --device=xpu \
+  -v $HOME/.cache:/home/dynamo/.cache -p 8000:8000 -it
 ```
 
 ### Testing Workflow
@@ -478,6 +549,8 @@ etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0
 
 # 4. Compile code
 cargo build --locked --features dynamo-llm/block-manager --workspace
+# Add `--features request-trace-s3` to enable the S3 request-trace sink
+# (DYN_REQUEST_TRACE_SINKS=s3); it is off by default to keep the local build lean.
 cd lib/bindings/python && maturin develop --uv && cd -
 
 # 5. Sanity check (optional but recommended)

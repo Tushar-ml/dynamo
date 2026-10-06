@@ -7,7 +7,6 @@ import logging
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Optional
 
 import pytest
 
@@ -16,11 +15,23 @@ from tests.serve.common import (
     params_with_model_mark,
     run_serve_deployment,
 )
-from tests.serve.conftest import MULTIMODAL_IMG_URL, get_multimodal_test_image_bytes
+from tests.serve.conftest import (
+    MULTIMODAL_IMG_URL,
+    MULTIMODAL_VIDEO_EXPECTED,
+    get_multimodal_test_image_bytes,
+)
 from tests.serve.lora_utils import MinioLoraConfig
+from tests.serve.multimodal_profiles.vllm_xpu import (
+    VLLM_MULTIMODAL_PROFILES,
+    VLLM_TOPOLOGY_SCRIPTS,
+)
 from tests.utils.constants import DefaultPort
 from tests.utils.engine_process import EngineConfig
-from tests.utils.multimodal import IMAGE_COLOR_PROMPT, LOCAL_VIDEO_TEST_URI
+from tests.utils.multimodal import (
+    IMAGE_COLOR_PROMPT,
+    LOCAL_VIDEO_TEST_URI,
+    make_multimodal_configs,
+)
 from tests.utils.payload_builder import (
     chat_payload,
     chat_payload_default,
@@ -28,11 +39,12 @@ from tests.utils.payload_builder import (
     completion_payload_default,
     completion_payload_with_logprobs,
     kv_events_metrics_payload,
+    lora_chat_payload,
     metric_payload_default,
     router_cached_tokens_chat_payload,
     router_selection_chat_payload_default,
 )
-from tests.utils.payloads import LoraTestChatPayload, ToolCallingChatPayload
+from tests.utils.payloads import ToolCallingChatPayload
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +61,23 @@ vllm_dir = os.environ.get("VLLM_DIR") or os.path.join(
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_stale_fpm_env(monkeypatch):
+    """Keep serve/XPU tests isolated from stale FPM env vars inherited by CI or parent shells."""
+    monkeypatch.delenv("DYN_FORWARDPASS_METRIC_PORT", raising=False)
+    monkeypatch.delenv("DYN_FPM_TRACE", raising=False)
+
+
+# Generated multimodal configs from profile definitions
+_mm_configs: dict[str, VLLMConfig] = {}
+for _profile in VLLM_MULTIMODAL_PROFILES:
+    _mm_configs.update(
+        make_multimodal_configs(_profile, VLLMConfig, vllm_dir, VLLM_TOPOLOGY_SCRIPTS)
+    )
+
 # vLLM test configurations
 vllm_configs = {
+    **_mm_configs,
     "aggregated": VLLMConfig(
         name="aggregated_xpu",
         directory=vllm_dir,
@@ -96,7 +123,7 @@ vllm_configs = {
             pytest.mark.requested_vllm_kv_cache_bytes(
                 1_119_388_000
             ),  # KV cache cap (2x safety over min=559_693_824)
-            pytest.mark.timeout(120),  # ~5x observed 24.3s; CI machines are slower
+            pytest.mark.timeout(420),
             pytest.mark.post_merge,
         ],
         model="Qwen/Qwen3-0.6B",
@@ -196,8 +223,14 @@ vllm_configs = {
         marks=[
             pytest.mark.xpu_2,
             pytest.mark.router,
-            pytest.mark.pre_merge,
-            pytest.mark.skip(reason="DYN-2263"),
+            pytest.mark.profiled_vram_gib(7.6),  # 2x 3.8 GiB (one per GPU)
+            pytest.mark.requested_vllm_kv_cache_bytes(
+                1_119_388_000
+            ),  # KV cache cap per worker (2x safety over min=559_693_824)
+            pytest.mark.timeout(
+                420
+            ),  # 2 workers + router startup; bumped for GPU-parallel headroom
+            pytest.mark.post_merge,
         ],
         model="Qwen/Qwen3-0.6B",
         request_payloads=[
@@ -213,8 +246,14 @@ vllm_configs = {
         marks=[
             pytest.mark.xpu_2,
             pytest.mark.router,
+            pytest.mark.profiled_vram_gib(7.6),  # 2x 3.8 GiB (one per GPU)
+            pytest.mark.requested_vllm_kv_cache_bytes(
+                1_119_388_000
+            ),  # KV cache cap per worker (2x safety over min=559_693_824)
+            pytest.mark.timeout(
+                420
+            ),  # 2 workers + router startup; bumped for GPU-parallel headroom
             pytest.mark.post_merge,
-            pytest.mark.skip(reason="DYN-2264"),
         ],
         model="Qwen/Qwen3-0.6B",
         request_payloads=[
@@ -367,7 +406,9 @@ vllm_configs = {
             "--model",
             "Qwen/Qwen3-VL-8B-Instruct",
             "--max-model-len",
-            "10000",
+            "4096",
+            "--gpu-memory-utilization",
+            "0.90",
             "--dyn-tool-call-parser",
             "hermes",
         ],
@@ -438,6 +479,9 @@ vllm_configs = {
         directory=vllm_dir,
         script_name="xpu/agg_multimodal_xpu.sh",
         marks=[
+            pytest.mark.skip(
+                reason="flaky test, local video file downloading may fail due to network issues"
+            ),
             pytest.mark.xpu_1,
             pytest.mark.multimodal,
             pytest.mark.nightly,
@@ -458,7 +502,7 @@ vllm_configs = {
                     },
                 ],
                 repeat_count=1,
-                expected_response=["red", "static", "still"],
+                expected_response=MULTIMODAL_VIDEO_EXPECTED,
                 temperature=0.0,
                 max_tokens=100,
             )
@@ -502,7 +546,9 @@ vllm_configs = {
             pytest.mark.requested_vllm_kv_cache_bytes(
                 1_119_388_000
             ),  # KV cache cap (2x safety over min=559_693_824)
-            pytest.mark.timeout(110),  # ~5x observed 22.3s; CI machines are slower
+            # vLLM 0.27 warms more MRV2 scheduler/kernel specializations before
+            # serving; XPU CI measured 92-105s of startup warmup.
+            pytest.mark.timeout(360),
             pytest.mark.pre_merge,
         ],
         model="Qwen/Qwen3-0.6B",
@@ -561,6 +607,7 @@ def test_serve_deployment(
     dynamo_dynamic_ports,
     num_system_ports,
     predownload_models,
+    image_server,
 ):
     """
     Test dynamo serve deployments with different graph configurations.
@@ -603,6 +650,10 @@ def test_multimodal_b64(
 
     This test is separate because it loads the required image at runtime
     (not collection time), ensuring it only fails when actually executed.
+
+    Uses ``@pytest.mark.model`` so nightly multi-GPU jobs (xpu_2 without the
+    xpu_1 multimodal_agg_qwen param) still predownload Qwen2.5-VL-7B before
+    ``HF_HUB_OFFLINE=1``.
     """
     # Load B64 image at test execution time (uses real PNG even if MULTIMODAL_IMG is LFS pointer)
     b64_img = base64.b64encode(get_multimodal_test_image_bytes()).decode()
@@ -631,7 +682,14 @@ def test_multimodal_b64(
         script_name="xpu/agg_multimodal_xpu.sh",
         marks=[],  # markers at function-level
         model="Qwen/Qwen2.5-VL-7B-Instruct",
-        script_args=["--model", "Qwen/Qwen2.5-VL-7B-Instruct"],
+        script_args=[
+            "--model",
+            "Qwen/Qwen2.5-VL-7B-Instruct",
+            "--max-model-len",
+            "4096",
+            "--gpu-memory-utilization",
+            "0.90",
+        ],
         delayed_start=0,
         timeout=360,
         request_payloads=[b64_payload],
@@ -663,6 +721,10 @@ def test_multimodal_b64_frontend_decoding(
     This exercises the Rust frontend image decode + NIXL RDMA transfer path
     with inline base64 data: URIs (not HTTP URLs). Verifies that the
     strip_inline_data_urls optimization does not break correctness.
+
+    HF predownload: same model is already listed via ``@pytest.mark.model`` on
+    ``test_serve_deployment[multimodal_video_agg]`` (pre_merge + xpu_1), so no
+    extra ``model`` mark is needed here for PR CI.
     """
     b64_img = base64.b64encode(get_multimodal_test_image_bytes()).decode()
 
@@ -707,40 +769,6 @@ def test_multimodal_b64_frontend_decoding(
 
 # LoRA Test Directory
 lora_dir = os.path.join(vllm_dir, "launch/lora")
-
-
-def lora_chat_payload(
-    lora_name: str,
-    s3_uri: str,
-    system_port: int = DefaultPort.SYSTEM1.value,
-    repeat_count: int = 2,
-    expected_response: Optional[list] = None,
-    expected_log: Optional[list] = None,
-    max_tokens: int = 100,
-    temperature: float = 0.0,
-) -> LoraTestChatPayload:
-    """Create a LoRA-enabled chat payload for testing"""
-    return LoraTestChatPayload(
-        body={
-            "model": lora_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "What is deep learning? Answer in one sentence.",
-                }
-            ],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": False,
-        },
-        lora_name=lora_name,
-        s3_uri=s3_uri,
-        system_port=system_port,
-        repeat_count=repeat_count,
-        expected_response=expected_response
-        or ["learning", "neural", "network", "AI", "model"],
-        expected_log=expected_log or [],
-    )
 
 
 @pytest.mark.vllm

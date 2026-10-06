@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use dynamo_backend_common::{
     AsyncEngineContext, BackendError, CommonArgs, ComponentSnapshot, DisaggregationMode,
     DynamoError, EngineConfig, ErrorType, GenerateContext, HEALTH_CHECK_KEY, KvEventSource,
-    LLMEngine, LLMEngineOutput, LLMEngineOutputExt, MetricsBindings, MetricsCtx,
+    LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, MetricsBindings, MetricsCtx,
     PreprocessedRequest, SnapshotPublisher, TopLogprob, WorkerConfig, chunk, usage,
 };
 use dynamo_mocker::common::protocols::{
@@ -253,6 +253,14 @@ impl MockerBackend {
 
         let engine_args = build_engine_args(&args)?;
         let disaggregation_mode = args.common.disaggregation_mode;
+        let (tool_call_parser, reasoning_parser) = if disaggregation_mode.is_prefill() {
+            (None, None)
+        } else {
+            (
+                args.common.dyn_tool_call_parser.clone(),
+                args.common.dyn_reasoning_parser.clone(),
+            )
+        };
         let engine = Self::new(
             args.model_name.clone(),
             args.context_length,
@@ -266,8 +274,13 @@ impl MockerBackend {
             endpoint_types: args.common.endpoint_types,
             custom_jinja_template: args.common.custom_jinja_template,
             disaggregation_mode,
+            route_to_encoder: args.common.route_to_encoder,
+            enable_rl: args.common.enable_rl,
             model_name: args.model_path,
             served_model_name: Some(args.model_name),
+            tool_call_parser,
+            reasoning_parser,
+            exclude_tools_when_tool_choice_none: args.common.exclude_tools_when_tool_choice_none,
             ..Default::default()
         };
         Ok((engine, config))
@@ -293,7 +306,8 @@ impl LLMEngine for MockerBackend {
             KvEventPublishers::default(),
             Some(self.cancel.clone()),
             FpmPublisher::default(),
-        );
+        )
+        .map_err(|error| engine_shutdown(format!("failed to start Mocker scheduler: {error:#}")))?;
 
         // The `initialized()` check + these `set()` calls are not atomic,
         // so concurrent `start()` callers could both pass the check and
@@ -341,19 +355,23 @@ impl LLMEngine for MockerBackend {
         Ok(EngineConfig {
             model: self.model_name.clone(),
             served_model_name: Some(self.model_name.clone()),
-            context_length: Some(self.context_length),
-            kv_cache_block_size: Some(self.engine_args.block_size as u32),
-            total_kv_blocks: Some(self.engine_args.num_gpu_blocks as u64),
-            max_num_seqs: self.engine_args.max_num_seqs.map(|v| v as u64),
-            max_num_batched_tokens: self.engine_args.max_num_batched_tokens.map(|v| v as u64),
-            data_parallel_size: None,
-            data_parallel_start_rank: None,
-            // Mocker has no real KV transport, so it never advertises a
-            // bootstrap address. Real prefill engines populate these in
-            // start() to publish ModelRuntimeConfig.disaggregated_endpoint.
-            bootstrap_host: None,
-            bootstrap_port: None,
+            model_aliases: Vec::new(),
             runtime_data: Default::default(),
+            llm: Some(LlmRegistration {
+                context_length: Some(self.context_length),
+                kv_cache_block_size: Some(self.engine_args.block_size as u32),
+                total_kv_blocks: Some(self.engine_args.num_gpu_blocks as u64),
+                max_num_seqs: self.engine_args.max_num_seqs.map(|v| v as u64),
+                max_num_batched_tokens: self.engine_args.max_num_batched_tokens.map(|v| v as u64),
+                max_gpu_lora_count: None,
+                data_parallel_size: None,
+                data_parallel_start_rank: None,
+                enable_eagle: false,
+                // Mocker has no real KV transport, so it never advertises a
+                // bootstrap address.
+                bootstrap_host: None,
+                bootstrap_port: None,
+            }),
         })
     }
 
@@ -414,11 +432,12 @@ impl LLMEngine for MockerBackend {
         }
 
         let direct = DirectRequest {
-            tokens: request.token_ids.clone(),
+            tokens: request.token_ids.as_ref().clone(),
             max_output_tokens,
             uuid: Some(uuid),
             dp_rank: DP_RANK,
             arrival_timestamp_ms: request.request_timestamp_ms,
+            ..Default::default()
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<OutputSignal>();
@@ -430,8 +449,16 @@ impl LLMEngine for MockerBackend {
             },
         );
 
+        // Install the guard before enqueueing so a closed compatibility lane
+        // also releases the active entry.
+        let mut guard = ActiveRequestGuard {
+            uuid,
+            active: self.active.clone(),
+            kv_used_blocks: self.kv_used_blocks.clone(),
+            blocks_held: 0,
+        };
+
         if request_tx.send(direct).is_err() {
-            self.active.remove(&uuid);
             return Err(engine_shutdown("scheduler is not accepting requests"));
         }
 
@@ -443,13 +470,7 @@ impl LLMEngine for MockerBackend {
         let blocks_held = prompt_len.div_ceil(block_size) as u64;
         self.kv_used_blocks
             .fetch_add(blocks_held, Ordering::Relaxed);
-
-        let guard = ActiveRequestGuard {
-            uuid,
-            active: self.active.clone(),
-            kv_used_blocks: self.kv_used_blocks.clone(),
-            blocks_held,
-        };
+        guard.blocks_held = blocks_held;
 
         Ok(Box::pin(async_stream::stream! {
             let _guard = guard;
@@ -692,10 +713,13 @@ mod tests {
         let engine = test_engine();
         let cfg = engine.start(0).await.unwrap();
         assert_eq!(cfg.model, "mocker-model");
-        assert_eq!(cfg.kv_cache_block_size, Some(64));
-        assert_eq!(cfg.total_kv_blocks, Some(16384));
-        assert_eq!(cfg.max_num_seqs, Some(256));
-        assert_eq!(cfg.context_length, Some(8192));
+        let llm = cfg
+            .llm
+            .expect("LLM engine advertises registration metadata");
+        assert_eq!(llm.kv_cache_block_size, Some(64));
+        assert_eq!(llm.total_kv_blocks, Some(16384));
+        assert_eq!(llm.max_num_seqs, Some(256));
+        assert_eq!(llm.context_length, Some(8192));
         engine.cleanup().await.unwrap();
     }
 
@@ -868,6 +892,29 @@ mod tests {
         );
 
         engine.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_scheduler_queue_cleans_up_pending_request() {
+        let engine = test_engine();
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        drop(request_rx);
+        assert!(engine.request_tx.set(request_tx).is_ok());
+
+        let result = engine
+            .generate(request(Some(1)), gen_ctx(Context::new(()).context()))
+            .await;
+        let Err(err) = result else {
+            panic!("closed scheduler queue must reject the request");
+        };
+        assert_eq!(
+            err.error_type(),
+            ErrorType::Backend(BackendError::EngineShutdown)
+        );
+        assert!(
+            engine.active.is_empty(),
+            "failed enqueue must be removed from active state"
+        );
     }
 
     #[tokio::test]

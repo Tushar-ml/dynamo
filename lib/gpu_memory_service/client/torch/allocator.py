@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from gpu_memory_service.common.locks import GrantedLockType, RequestedLockType
+from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm_device_type
 
 if TYPE_CHECKING:
     import torch
     from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
-    from torch.cuda.memory import MemPool
+    from torch.cuda.memory import MemPool  # type alias; XPU MemPool has same API
 
 logger = logging.getLogger(__name__)
 
@@ -80,21 +81,46 @@ def _gms_free(ptr: int, size: int, device: int, stream: int) -> None:
 def _ensure_callbacks_initialized() -> None:
     global _callbacks_initialized, _pluggable_alloc
 
-    from gpu_memory_service.client.torch.extensions import _allocator_ext as cumem
-    from torch.cuda import CUDAPluggableAllocator
+    from gpu_memory_service.client.torch.extensions import _allocator_ext as _alloc_ext
 
     if _callbacks_initialized:
         return
 
-    _pluggable_alloc = CUDAPluggableAllocator(cumem.__file__, "my_malloc", "my_free")
-    cumem.init_module(_gms_malloc, _gms_free)
+    device_type = get_vmm_device_type()
+    if device_type == VMMDeviceType.CUDA:
+        from torch.cuda import CUDAPluggableAllocator
+
+        _pluggable_alloc = CUDAPluggableAllocator(
+            _alloc_ext.__file__, "my_malloc", "my_free"
+        )
+    elif device_type == VMMDeviceType.XPU:
+        from torch.xpu import XPUPluggableAllocator
+
+        _pluggable_alloc = XPUPluggableAllocator(
+            _alloc_ext.__file__, "my_malloc", "my_free"
+        )
+    else:
+        raise NotImplementedError(
+            f"GMS torch mempool integration unsupported for device_type={device_type.value}"
+        )
+
+    _alloc_ext.init_module(_gms_malloc, _gms_free)
     _callbacks_initialized = True
 
 
 def _create_mem_pool() -> "MemPool":
-    from torch.cuda.memory import MemPool
-
     assert _pluggable_alloc is not None
+
+    device_type = get_vmm_device_type()
+    if device_type == VMMDeviceType.CUDA:
+        from torch.cuda.memory import MemPool
+    elif device_type == VMMDeviceType.XPU:
+        from torch.xpu.memory import MemPool
+    else:
+        raise NotImplementedError(
+            f"GMS torch mempool integration unsupported for device_type={device_type.value}"
+        )
+
     return MemPool(allocator=_pluggable_alloc.allocator())
 
 
@@ -172,14 +198,15 @@ def get_or_create_scratch_manager(
     device: int,
     *,
     tag: str = "kv_cache",
+    scratch_size: int = 512 * 1024 * 1024,
 ) -> "GMSClientMemoryManager":
     """Register an unconnected manager for client-local scratch allocation.
 
     The manager is constructed but .connect() is NOT called. _gms_malloc routes
     via create_scratch_mapping while is_scratch is True. Caller must invoke
     .connect(...) before any server-backed operation, then call
-    ensure_scratch_disabled(manager) to flip routing to the standard
-    create_mapping path.
+    manager.prepare_scratch_for_reallocation() to move preserved-VA bookkeeping
+    and flip routing to the standard create_mapping path.
     """
     from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
 
@@ -196,9 +223,19 @@ def get_or_create_scratch_manager(
                 f"GMS allocator tag={tag} already registered as non-scratch; "
                 "use get_or_create_gms_client_memory_manager instead"
             )
+        if state.manager.scratch_size != scratch_size:
+            raise RuntimeError(
+                f"GMS scratch allocator tag={tag} was initialized with "
+                f"scratch_size={state.manager.scratch_size}, not {scratch_size}"
+            )
         return state.manager
 
-    manager = GMSClientMemoryManager(socket_path, device=device, tag=tag)
+    manager = GMSClientMemoryManager(
+        socket_path,
+        device=device,
+        tag=tag,
+        scratch_size=scratch_size,
+    )
     _ensure_callbacks_initialized()
     mem_pool = _create_mem_pool()
 
@@ -227,30 +264,6 @@ def is_scratch(manager: "GMSClientMemoryManager") -> bool:
     if state is None:
         raise RuntimeError(f"tag {manager.tag!r} not in _tag_states")
     return state.is_scratch
-
-
-def ensure_scratch_disabled(manager: "GMSClientMemoryManager") -> None:
-    """Flip the manager's tag out of scratch routing.
-
-    After this, _gms_malloc routes via create_mapping (server-backed) on the
-    tag's mempool. Idempotent. Raises if the manager is not registered or
-    not currently RW-connected — server-backed allocations require RW.
-
-    Call after migrating scratch entries into _mappings via
-    prepare_scratch_for_reallocation, before reallocate_all_handles.
-    """
-    if manager.tag is None:
-        raise RuntimeError("manager has no tag; not registered in allocator")
-    state = _tag_states.get(manager.tag)
-    if state is None:
-        raise RuntimeError(f"tag {manager.tag!r} not in _tag_states")
-    if manager.granted_lock_type != GrantedLockType.RW:
-        raise RuntimeError(
-            f"ensure_scratch_disabled requires RW grant on tag={manager.tag!r}; "
-            f"got granted_lock_type={manager.granted_lock_type}. "
-            "Did you forget to .connect(RequestedLockType.RW) first?"
-        )
-    state.is_scratch = False
 
 
 def get_gms_client_memory_manager(
@@ -297,9 +310,9 @@ def prune_allocations(
         return
 
     if synchronize:
-        import torch
+        from gpu_memory_service.integrations.common.utils import torch_device
 
-        torch.cuda.synchronize(manager.device)
+        torch_device().synchronize(manager.device)
 
     keep = {str(allocation_id) for allocation_id in referenced_allocation_ids}
 
@@ -343,7 +356,12 @@ def gms_use_mem_pool(tag: str, device: "torch.device | int") -> Iterator[None]:
 
     token = _active_tag.set(tag)
     try:
-        with torch.cuda.use_mem_pool(state.mem_pool, device=device):
-            yield
+        device_type = get_vmm_device_type()
+        if device_type == VMMDeviceType.XPU:
+            with torch.xpu.use_mem_pool(state.mem_pool, device=device):
+                yield
+        else:
+            with torch.cuda.use_mem_pool(state.mem_pool, device=device):
+                yield
     finally:
         _active_tag.reset(token)

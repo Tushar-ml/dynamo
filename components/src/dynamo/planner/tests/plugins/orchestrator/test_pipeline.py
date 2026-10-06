@@ -155,6 +155,35 @@ async def test_propose_output_flows_as_reconcile_baseline(ctx_factory):
     outcome = await orchestrator.tick(PipelineContext(), {PREFILL: 3})
     assert outcome.execute_action == "apply"
     assert outcome.final_proposal.targets[0].replicas == 7
+    assert outcome.proposed_components == frozenset({PREFILL})
+
+
+@pytest.mark.asyncio
+async def test_proposed_component_mask_is_captured_before_later_stage_merges(
+    ctx_factory,
+):
+    ctx = ctx_factory()
+    orchestrator = ctx["orchestrator"]
+    orchestrator.register_internal(
+        plugin_id="propose_prefill",
+        plugin_type="propose",
+        priority=10,
+        instance=StubPlugin(propose=_propose_override(7, "prefill")),
+    )
+    orchestrator.register_internal(
+        plugin_id="reconcile_decode",
+        plugin_type="reconcile",
+        priority=10,
+        instance=StubPlugin(reconcile=_reconcile_override(5, "decode")),
+    )
+
+    outcome = await orchestrator.tick(
+        PipelineContext(),
+        {PREFILL: 3, ComponentKey(sub_component_type="decode"): 2},
+    )
+
+    assert outcome.execute_action == "apply"
+    assert outcome.proposed_components == frozenset({PREFILL})
 
 
 @pytest.mark.asyncio
@@ -365,8 +394,8 @@ async def test_hold_last_cache_inherits_on_idle_tick(ctx_factory):
     ctx = ctx_factory()
     orchestrator = ctx["orchestrator"]
     clock = ctx["clock"]
-    # execution_interval=10s, HOLD_LAST → first tick fires after interval
-    # elapses (PSM-parity anchor), mid-interval tick inherits cache.
+    # execution_interval=10s, HOLD_LAST -> first tick fires after interval
+    # elapses, mid-interval tick inherits cache.
     orchestrator.register_internal(
         plugin_id="propose",
         plugin_type="propose",
@@ -727,8 +756,8 @@ async def test_predict_plugin_throttled_by_execution_interval(ctx_factory):
         is_builtin=True,
     )
     # First fire happens when interval elapses since registration
-    # (PSM-parity anchor — see test_first_fire_anchored_on_registration
-    # _time).  Pre-PR-1 fix: first-ever fired on tick 1 regardless.
+    # (see test_first_fire_anchored_on_registration_time).
+    # Pre-PR-1 fix: first-ever fired on tick 1 regardless.
     ctx["clock"].advance(60.0)
     await ctx["orchestrator"].tick(PipelineContext(), {PREFILL: 3})
     assert stub.call_counts["Predict"] == 1

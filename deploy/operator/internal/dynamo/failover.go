@@ -109,7 +109,8 @@ func applyGMSSharedResources(podSpec *corev1.PodSpec, c *corev1.Container, rank 
 // layout (a restarted engine re-imports IPC handles from the still-running
 // GMS server). In the inter-pod GMS failover layout, augmentEngineForGMS
 // overrides the engine's RestartPolicy to Never so the cohort can only be
-// recovered via FailoverCascadeReconciler; see the comment there.
+// recovered by the failover cascade controller; see
+// failover_cascade_controller.go.
 func gmsWeightServerPodSpec(basePodSpec *corev1.PodSpec, rank int32, gpuCount int) *corev1.PodSpec {
 	podSpec := basePodSpec.DeepCopy()
 	if len(podSpec.Containers) == 0 {
@@ -184,7 +185,7 @@ func gmsEngineEnvVars() []corev1.EnvVar {
 //     coordination via the failover lock file and DYN_VLLM_GMS_SHADOW_MODE.
 //     An in-place restart leaves the cohort in a half-torn-down state and
 //     blocks recovery. The correct recovery path is for the pod to exit,
-//     FailoverCascadeReconciler (see failover_cascade_controller.go) to
+//     the failover cascade controller (failover_cascade_controller.go) to
 //     force-delete the full engine group based on the
 //     KubeLabelDynamoFailoverEngineGroupMember label, and Grove to recreate
 //     the cohort from scratch. That label is applied in graph.go only when
@@ -310,13 +311,14 @@ func gmsRCTName(serviceName string, rank int32) string {
 }
 
 // gmsResourceClaimTemplateConfigs builds one PCS-level ResourceClaimTemplateConfig
-// per rank. Each RCT has the same GPU spec but a distinct per-rank name so that
-// each rank's GMS + engine pods get their own ResourceClaim.
-func gmsResourceClaimTemplateConfigs(serviceName string, gmsSpec *v1beta1.GPUMemoryServiceSpec, resources corev1.ResourceRequirements, roles []ServiceRole) ([]grovev1alpha1.ResourceClaimTemplateConfig, error) {
-	gpuCount, err := getGPUCount(resources)
-	if err != nil {
-		return nil, err
-	}
+// per rank. Each rank resolves the complete template for its semantic engine
+// role, so Leader and Worker may request different GPU counts.
+func gmsResourceClaimTemplateConfigs(
+	serviceName string,
+	gmsSpec *v1beta1.GPUMemoryServiceSpec,
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+	roles []ServiceRole,
+) ([]grovev1alpha1.ResourceClaimTemplateConfig, error) {
 	seen := map[int32]bool{}
 	configs := make([]grovev1alpha1.ResourceClaimTemplateConfig, 0, len(roles))
 	for _, r := range roles {
@@ -324,6 +326,18 @@ func gmsResourceClaimTemplateConfigs(serviceName string, gmsSpec *v1beta1.GPUMem
 			continue
 		}
 		seen[r.Rank] = true
+		engineRole, ok := engineRoleForRank(roles, r.Rank)
+		if !ok {
+			return nil, fmt.Errorf("rank %d has no engine role", r.Rank)
+		}
+		resourceComponent, err := EffectiveComponentForRole(component, engineRole)
+		if err != nil {
+			return nil, fmt.Errorf("resolve GPU resources for rank %d role %q: %w", r.Rank, engineRole, err)
+		}
+		gpuCount, err := getGPUCount(GetMainContainerResources(resourceComponent))
+		if err != nil {
+			return nil, fmt.Errorf("resolve GPU count for rank %d role %q: %w", r.Rank, engineRole, err)
+		}
 		configs = append(configs, grovev1alpha1.ResourceClaimTemplateConfig{
 			Name: gmsRCTName(serviceName, r.Rank),
 			TemplateSpec: resourcev1.ResourceClaimTemplateSpec{
@@ -345,6 +359,15 @@ func gmsResourceClaimTemplateConfigs(serviceName string, gmsSpec *v1beta1.GPUMem
 		})
 	}
 	return configs, nil
+}
+
+func engineRoleForRank(roles []ServiceRole, rank int32) (Role, bool) {
+	for _, role := range roles {
+		if role.Rank == rank && role.Role != RoleGMS {
+			return role.Role, true
+		}
+	}
+	return "", false
 }
 
 // gmsResourceSharingEntries builds one PCSG-level ResourceSharingSpec per rank.

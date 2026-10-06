@@ -7,11 +7,14 @@ use super::*;
 use dynamo_kv_router::protocols::{
     KvTransferEnforcement as RsKvTransferEnforcement, RoutingConstraints as RsRoutingConstraints,
 };
+use dynamo_runtime::protocols::EndpointId;
 use llm_rs::local_model::runtime_config::DisaggregatedEndpoint as RsDisaggregatedEndpoint;
 use llm_rs::local_model::runtime_config::ModelRuntimeConfig as RsModelRuntimeConfig;
 use llm_rs::local_model::runtime_config::StructuralTagMode as RsStructuralTagMode;
 use llm_rs::local_model::runtime_config::StructuralTagSchemaMode as RsStructuralTagSchemaMode;
 use llm_rs::local_model::runtime_config::StructuralTagScope as RsStructuralTagScope;
+use llm_rs::local_model::runtime_config::TokenizerBackend as RsTokenizerBackend;
+use llm_rs::protocols::tensor::TensorModelConfig;
 use pyo3::exceptions::PyValueError;
 
 fn validate_model_runtime_config(config: &RsModelRuntimeConfig) -> PyResult<()> {
@@ -72,6 +75,20 @@ impl ModelRuntimeConfig {
     }
 }
 
+pub(crate) fn parse_tensor_model_config(
+    tensor_model_config: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<TensorModelConfig>> {
+    tensor_model_config
+        .map(|config| {
+            pythonize::depythonize(config).map_err(|err| {
+                PyErr::new::<PyException, _>(format!(
+                    "Failed to convert tensor_model_config: {err}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 #[pymethods]
 impl ModelRuntimeConfig {
     #[new]
@@ -86,6 +103,11 @@ impl ModelRuntimeConfig {
     #[setter]
     fn set_total_kv_blocks(&mut self, total_kv_blocks: u64) {
         self.inner.total_kv_blocks = Some(total_kv_blocks);
+    }
+
+    #[setter]
+    fn set_context_length(&mut self, context_length: Option<u32>) {
+        self.inner.context_length = context_length;
     }
 
     #[setter]
@@ -109,6 +131,18 @@ impl ModelRuntimeConfig {
     }
 
     #[setter]
+    fn set_tokenizer_backend(&mut self, tokenizer_backend: Option<String>) -> PyResult<()> {
+        self.inner.tokenizer_backend = tokenizer_backend
+            .map(|backend| {
+                backend
+                    .parse::<RsTokenizerBackend>()
+                    .map_err(PyValueError::new_err)
+            })
+            .transpose()?;
+        Ok(())
+    }
+
+    #[setter]
     fn set_data_parallel_start_rank(&mut self, data_parallel_start_rank: u32) {
         self.inner.data_parallel_start_rank = data_parallel_start_rank;
     }
@@ -121,6 +155,21 @@ impl ModelRuntimeConfig {
     #[setter]
     fn set_enable_local_indexer(&mut self, enable_local_indexer: bool) {
         self.inner.enable_local_indexer = enable_local_indexer;
+    }
+
+    #[setter]
+    fn set_kv_event_publishing_enabled(&mut self, enabled: Option<bool>) {
+        self.inner.kv_event_publishing_enabled = enabled;
+    }
+
+    #[setter]
+    fn set_kv_event_source_mode(&mut self, mode: Option<String>) {
+        self.inner.kv_event_source_mode = mode;
+    }
+
+    #[setter]
+    fn set_kv_state_endpoint(&mut self, kv_state_endpoint: Option<String>) {
+        self.inner.kv_state_endpoint = kv_state_endpoint.as_deref().map(EndpointId::from);
     }
 
     #[setter]
@@ -159,30 +208,14 @@ impl ModelRuntimeConfig {
         Ok(())
     }
 
-    fn set_tensor_model_config(
-        &mut self,
-        _py: Python<'_>,
-        tensor_model_config: &Bound<'_, PyDict>,
-    ) -> PyResult<()> {
-        let tensor_model_config = pythonize::depythonize(tensor_model_config).map_err(|err| {
-            PyErr::new::<PyException, _>(format!("Failed to convert tensor_model_config: {}", err))
-        })?;
-        self.inner.tensor_model_config = Some(tensor_model_config);
-        Ok(())
-    }
-
-    fn get_tensor_model_config(&self, _py: Python<'_>) -> PyResult<Option<PyObject>> {
-        if let Some(tensor_model_config) = &self.inner.tensor_model_config {
-            let py_obj = pythonize::pythonize(_py, tensor_model_config).map_err(to_pyerr)?;
-            Ok(Some(py_obj.unbind()))
-        } else {
-            Ok(None)
-        }
-    }
-
     #[getter]
     fn total_kv_blocks(&self) -> Option<u64> {
         self.inner.total_kv_blocks
+    }
+
+    #[getter]
+    fn context_length(&self) -> Option<u32> {
+        self.inner.context_length
     }
 
     #[getter]
@@ -206,8 +239,43 @@ impl ModelRuntimeConfig {
     }
 
     #[getter]
+    fn tokenizer_backend(&self) -> Option<String> {
+        self.inner
+            .tokenizer_backend
+            .map(|backend| backend.as_str().to_string())
+    }
+
+    #[getter]
+    fn data_parallel_start_rank(&self) -> u32 {
+        self.inner.data_parallel_start_rank
+    }
+
+    #[getter]
+    fn data_parallel_size(&self) -> u32 {
+        self.inner.data_parallel_size
+    }
+
+    #[getter]
     fn enable_local_indexer(&self) -> bool {
         self.inner.enable_local_indexer
+    }
+
+    #[getter]
+    fn kv_event_publishing_enabled(&self) -> Option<bool> {
+        self.inner.kv_event_publishing_enabled
+    }
+
+    #[getter]
+    fn kv_event_source_mode(&self) -> Option<String> {
+        self.inner.kv_event_source_mode.clone()
+    }
+
+    #[getter]
+    fn kv_state_endpoint(&self) -> Option<String> {
+        self.inner
+            .kv_state_endpoint
+            .as_ref()
+            .map(ToString::to_string)
     }
 
     #[getter]

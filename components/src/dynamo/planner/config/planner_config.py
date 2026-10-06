@@ -17,9 +17,11 @@ import json
 import logging
 import math
 import os
+from copy import deepcopy
+from dataclasses import asdict
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Protocol
 from urllib.parse import parse_qsl
 
 import yaml
@@ -34,11 +36,35 @@ from pydantic import (
 
 from dynamo.planner.config.aic_interpolation_spec import AICInterpolationSpec
 from dynamo.planner.config.defaults import SLAPlannerDefaults
-from dynamo.planner.config.parallelization import PickedParallelConfig
 from dynamo.planner.plugins.registry.config import PluginRegistrationConfig
 from dynamo.planner.plugins.types import HoldPolicy
 
 logger = logging.getLogger(__name__)
+
+
+class MinimumEndpointConfig(Protocol):
+    """Configuration fields used to resolve component endpoint floors."""
+
+    min_endpoint: int
+    prefill_min_endpoint: Optional[int]
+    decode_min_endpoint: Optional[int]
+
+
+def resolve_min_endpoint(
+    config: MinimumEndpointConfig, component: Literal["prefill", "decode"]
+) -> int:
+    """Return the configured minimum for one planner role.
+
+    ``min_endpoint`` supplies a role's value when its role-specific value is
+    unset.
+    """
+
+    value = (
+        config.prefill_min_endpoint
+        if component == "prefill"
+        else config.decode_min_endpoint
+    )
+    return config.min_endpoint if value is None else value
 
 
 def _prometheus_ssl_verify_default() -> bool:
@@ -49,34 +75,66 @@ def _prometheus_ssl_verify_default() -> bool:
     )
 
 
+def _gcd_seconds(values: list[float]) -> float:
+    """Return a millisecond-resolution gcd for second-based intervals."""
+    millis = [round(v * 1000.0) for v in values]
+    gcd_ms = millis[0]
+    for value in millis[1:]:
+        gcd_ms = math.gcd(gcd_ms, value)
+    return gcd_ms / 1000.0
+
+
+def _is_multiple_of(value: float, base: float) -> bool:
+    if base <= 0:
+        return False
+    ratio = value / base
+    return math.isclose(ratio, round(ratio), rel_tol=1e-9, abs_tol=1e-9)
+
+
 class PlannerPreDeploymentSweepMode(str, Enum):
     None_ = "none"
     Rapid = "rapid"
     Thorough = "thorough"
 
 
-class AICPerfModelSpec(BaseModel):
-    """Native AIC model identity used by the Rust engine perf shim.
+class AISPerfModelSpec(BaseModel):
+    """Role-indexed AISimulate canonical configurations.
 
-    Unlike ``AICInterpolationSpec``, this does not describe an AIC sweep.
-    It is the forward-pass model/backend/parallelism identity used for
-    real-time shim queries. Unsupported native AIC configs are allowed: the
-    shim falls back to FPM regression and can still tune from observations.
+    The SDK owns the estimator schema. Dynamo binds each configuration to
+    its deployment role.
     """
 
-    hf_id: str = Field(description="HuggingFace model id, e.g. Qwen/Qwen3-32B")
-    system: str = Field(description="AIC system identifier, e.g. h200_sxm")
-    backend: Literal["trtllm", "vllm", "sglang"]
-    backend_version: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
 
-    prefill_pick: Optional[PickedParallelConfig] = None
-    decode_pick: Optional[PickedParallelConfig] = None
+    roles: dict[Literal["prefill", "decode", "aggregated"], dict[str, Any]]
 
-    model_arch: Optional[str] = None
-    weight_dtype: Optional[str] = None
-    moe_dtype: Optional[str] = None
-    activation_dtype: Optional[str] = None
-    kv_cache_dtype: Optional[str] = None
+    @field_validator("roles")
+    @classmethod
+    def validate_role_identity(
+        cls, roles: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        # Operator schema generation imports this module without the optional
+        # estimator runtime. Require AIS only when validating an AIS config.
+        from aisimulate_core import RustForwardPassPerfModel
+        from aisimulate_core.sdk import ForwardPassPerfModelConfig
+
+        result = {}
+        for role, config in roles.items():
+            config = deepcopy(config)
+            if config.get("worker_type", role) != role:
+                raise ValueError(f"AIS role {role!r} conflicts with worker_type")
+            config["worker_type"] = role
+            try:
+                # Use the installed SDK's fields/defaults; never duplicate its
+                # expanding schema or discard an unrecognized input field.
+                request = ForwardPassPerfModelConfig(**config)
+                RustForwardPassPerfModel.normalize_config(json.dumps(request.to_dict()))
+                # Keep authored roots portable and controls explicit; to_dict()
+                # resolves package/env roots on the machine doing validation.
+                result[role] = asdict(request)
+            except TypeError as error:
+                raise ValueError(f"invalid AIS config for {role}: {error}") from error
+        return result
 
 
 class ExternalPluginEntry(BaseModel):
@@ -285,33 +343,15 @@ class GatewayConfig(BaseModel):
 class SchedulingConfig(BaseModel):
     """Planner-level scheduling config.
 
-    Controls which tick engine drives the planner and how long each
-    tick may run. Backwards compatible: all fields have safe defaults,
-    so existing deployments see no behaviour change until
-    ``use_orchestrator=True`` is set explicitly. Read by
-    ``NativePlannerBase`` at startup.
+    Controls plugin-pipeline scheduling and how long each tick may run.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    use_orchestrator: bool = Field(
-        default=False,
-        description=(
-            "Feature flag: when True, the planner drives ticks through "
-            "``LocalPlannerOrchestrator`` + real builtin plugins; when "
-            "False (default), uses the legacy ``PlannerStateMachine`` "
-            "path. Both paths are wired in ``NativePlannerBase`` via "
-            "``EngineProtocol``. Defaulted OFF so upgrade ≠ cutover — "
-            "operations control the enable timing."
-        ),
-    )
     tick_max_duration_seconds: float = Field(
         default=30.0,
         gt=0,
-        description=(
-            "Outermost deadline wrapping the entire 4-stage pipeline "
-            "(orchestrator path only)."
-        ),
+        description=("Outermost deadline wrapping the entire 4-stage plugin pipeline."),
     )
     external_plugins: list[ExternalPluginEntry] = Field(
         default_factory=list,
@@ -320,17 +360,12 @@ class SchedulingConfig(BaseModel):
             "is registered at planner startup via the same code path "
             "the gRPC gateway would use — so behaviour is "
             "identical between static-config and self-register models. "
-            "Per-entry register failures are logged but do not crash "
-            "the planner. Only used when ``use_orchestrator=True``; "
-            "ignored on the legacy PSM path."
+            "Per-entry register failures are logged but do not crash the planner."
         ),
     )
     gateway: GatewayConfig = Field(
         default_factory=GatewayConfig,
-        description=(
-            "gRPC registration gateway config. Default disabled. "
-            "Only used when ``use_orchestrator=True``."
-        ),
+        description=("gRPC registration gateway config. Default disabled."),
     )
     scale_interval_seconds: float = Field(
         default=5.0,
@@ -343,12 +378,7 @@ class SchedulingConfig(BaseModel):
             "which plugins actually fire each tick. Must be <= every "
             "plugin's ``execution_interval_seconds`` and a divisor of "
             "every plugin's ``observation_window_seconds`` so windows "
-            "align to tick boundaries. Ignored when "
-            "``use_orchestrator=False`` (PSM path uses its legacy "
-            "load_adjustment_interval_seconds / "
-            "throughput_adjustment_interval_seconds two-cadence model). "
-            "Surface added in PR #10124; full lazy-pull behaviour lands "
-            "in the engine_adapter rewrite commit later in this PR."
+            "align to tick boundaries."
         ),
     )
 
@@ -356,8 +386,8 @@ class SchedulingConfig(BaseModel):
 class PlannerConfig(BaseModel):
     """Pydantic configuration for the Dynamo Planner.
 
-    Replaces the argparse-based CLI. All fields mirror the former CLI flags
-    with defaults sourced from SLAPlannerDefaults.
+    Defines the JSON/YAML config consumed by ``python -m dynamo.planner``.
+    Defaults are sourced from SLAPlannerDefaults.
     """
 
     pre_deployment_sweeping_mode: Optional[PlannerPreDeploymentSweepMode] = Field(
@@ -387,7 +417,7 @@ class PlannerConfig(BaseModel):
             "depth and KV cache utilization — no SLA targets or profiling needed. "
             "'load' uses user-defined prefill queue token and decode KV "
             "utilization thresholds. "
-            "'sla' uses the Rust engine perf model to target specific "
+            "'sla' uses the AISimulate performance model to target specific "
             "ttft_ms/itl_ms values."
         ),
     )
@@ -400,6 +430,16 @@ class PlannerConfig(BaseModel):
             "throughput_adjustment_interval",
         ),
     )
+    max_throughput_scaling_replicas: int = Field(
+        default=SLAPlannerDefaults.max_throughput_scaling_replicas,
+        gt=0,
+        description=(
+            "Maximum replica-count change per component produced by one "
+            "throughput-scaling observation. The same limit applies to scale-up "
+            "and scale-down. Hard endpoint, GPU-budget, and power-budget recovery "
+            "may override this limit."
+        ),
+    )
     max_gpu_budget: int = SLAPlannerDefaults.max_gpu_budget
     min_gpu_budget: int = SLAPlannerDefaults.min_gpu_budget
     """Per-DGD GPU floor enforced by the local planner. -1 disables (default).
@@ -408,15 +448,51 @@ class PlannerConfig(BaseModel):
     planner pins the per-DGD total and only redistributes replicas between
     prefill and decode. Tolerance band:
     ``[min_gpu_budget - tolerance, max_gpu_budget + tolerance]`` where
-    ``tolerance = max(prefill_engine_num_gpu, decode_engine_num_gpu)`` —
-    needed because integer worker steps from pools with different per-replica
-    GPU counts can't always exactly cancel.
+    ``tolerance`` is the largest effective per-replica GPU cost among the
+    pools being adjusted. It can exceed the inference-engine width when a
+    replica contains independently allocated GPU sidecars. Integer worker
+    steps from pools with different costs cannot always exactly cancel.
 
     This is per-DGD scope. The GlobalPlanner has a separate cluster-wide
     ``min_total_gpus`` flag for cross-DGD enforcement; the two are
     orthogonal and can both be set.
     """
-    min_endpoint: int = SLAPlannerDefaults.min_endpoint
+    min_endpoint: int = Field(
+        default=SLAPlannerDefaults.min_endpoint,
+        ge=0,
+        description=(
+            "Minimum endpoints for aggregated mode. In disaggregated mode, this "
+            "value applies to both prefill and decode unless a role-specific "
+            "value is set. In prefill-only or decode-only mode, it supplies the "
+            "active role when the corresponding role-specific value is unset. "
+            "Must be nonnegative; 0 permits scale-to-zero."
+        ),
+    )
+    prefill_min_endpoint: Optional[int] = Field(
+        default=SLAPlannerDefaults.prefill_min_endpoint,
+        ge=1,
+        description=(
+            "Minimum prefill endpoints in disagg and prefill modes. When set, "
+            "replaces the prefill value supplied by min_endpoint."
+        ),
+    )
+    decode_min_endpoint: Optional[int] = Field(
+        default=SLAPlannerDefaults.decode_min_endpoint,
+        ge=1,
+        description=(
+            "Minimum decode endpoints in disagg and decode modes. When set, "
+            "replaces the decode value supplied by min_endpoint."
+        ),
+    )
+    control_api_port: int = Field(
+        default=SLAPlannerDefaults.control_api_port,
+        ge=0,
+        le=65535,
+        description=(
+            "Port for the localhost-only runtime endpoint and GPU-budget API. "
+            "Set to 0 to disable the API."
+        ),
+    )
 
     decode_engine_num_gpu: Optional[int] = None
     prefill_engine_num_gpu: Optional[int] = None
@@ -433,16 +509,24 @@ class PlannerConfig(BaseModel):
             "the legacy profile_results_dir file loader)."
         ),
     )
-    aic_perf_model: Optional[AICPerfModelSpec] = Field(
+    ais_perf_model: Optional[AISPerfModelSpec] = Field(
         default=None,
         description=(
-            "Native AIC forward-pass perf model identity for the Rust engine "
-            "perf shim. This enables real-time AIC estimates plus online "
-            "correction; unsupported native configs automatically fall back to "
-            "FPM regression in the shim. This field does not trigger AIC "
-            "interpolation sweeps."
+            "Role-indexed AISimulate ForwardPassPerfModelConfig mappings. "
+            "The SDK owns estimator selection, tuning, and validation; "
+            "new configs default to auto selection with fallback denied."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_perf_model_config(cls, values):
+        if isinstance(values, dict) and "aic_perf_model" in values:
+            raise ValueError(
+                "aic_perf_model is no longer supported; use ais_perf_model.roles "
+                "with canonical AISimulate configurations"
+            )
+        return values
 
     ttft_ms: float = Field(
         default=SLAPlannerDefaults.ttft_ms,
@@ -526,7 +610,25 @@ class PlannerConfig(BaseModel):
         validate_default=True,
         description=(
             "Path to a CA bundle for verifying the upstream Prometheus TLS certificate. "
-            "No-op unless ssl_verify is enabled."
+            "Setting this field enables TLS verification against the given bundle, "
+            "regardless of ssl_verify."
+        ),
+    )
+    metric_pulling_prometheus_request_timeout_seconds: float = Field(
+        default_factory=lambda: float(
+            os.environ.get(
+                "DYN_PLANNER_PROMETHEUS_REQUEST_TIMEOUT_SECONDS",
+                SLAPlannerDefaults.metric_pulling_prometheus_request_timeout_seconds,
+            )
+        ),
+        validate_default=True,
+        gt=0,
+        exclude=True,
+        description=(
+            "Connection and read inactivity timeout in seconds for each Prometheus "
+            "API request. This is not a total wall-clock deadline: a response that "
+            "continues delivering data can run longer. Failed requests are not "
+            "retried within the same collection cycle."
         ),
     )
 
@@ -559,6 +661,7 @@ class PlannerConfig(BaseModel):
     # Load-based scaling settings
     load_adjustment_interval_seconds: int = Field(
         default=SLAPlannerDefaults.load_adjustment_interval_seconds,
+        gt=0,
         validation_alias=AliasChoices(
             "load_adjustment_interval_seconds", "load_adjustment_interval"
         ),
@@ -595,9 +698,7 @@ class PlannerConfig(BaseModel):
         default=SLAPlannerDefaults.decode_scale_up_kv_rate,
         ge=0,
         le=100,
-        validation_alias=AliasChoices(
-            "decode_scale_up_kv_rate", "decode_sacle_up_kv_rate"
-        ),
+        validation_alias=AliasChoices("decode_scale_up_kv_rate"),
         description=(
             "Decode KV utilization percentage that triggers scale-up when "
             "optimization_target='load'. Accepts 0-100."
@@ -613,9 +714,54 @@ class PlannerConfig(BaseModel):
         ),
     )
     load_min_observations: int = SLAPlannerDefaults.load_min_observations
+    speculative_nextn: int = Field(
+        default=SLAPlannerDefaults.speculative_nextn,
+        ge=0,
+        description=(
+            "Manual fallback speculative decoding depth. Worker MDC "
+            "runtime_config.runtime_data.spec_decode.nextn takes precedence "
+            "when present."
+        ),
+    )
 
     # Advisory mode: compute and log decisions without executing scaling
     advisory: bool = SLAPlannerDefaults.advisory
+
+    # --- Power-aware budget (read-only caps; DGD-owned) ---
+    #
+    # Per-GPU caps are NOT configured here. They are authored on each worker
+    # component's ``podTemplate.metadata.annotations``
+    # (``dynamo.nvidia.com/gpu-power-limit``), applied to Pods by the operator,
+    # and enforced by the Power Agent. The operator projects those caps into
+    # component status; the Planner combines them with ``total_gpu_power_limit`` to project and clamp a
+    # power budget. It never writes per-GPU caps. These inputs are
+    # process-static; changing the total budget requires a Planner restart.
+    enable_power_awareness: bool = Field(
+        default=False,
+        description=(
+            "Enable power-aware budget projection and budget-gated replica "
+            "scaling. Per-GPU caps are read from operator-projected DGD component "
+            "status; this planner combines them with total_gpu_power_limit "
+            "to publish power-budget gauges and clamp scale-up. Requires "
+            "total_gpu_power_limit, environment='kubernetes', and "
+            "mode in ('disagg', 'prefill', 'decode'). Not supported for "
+            "mode='agg'."
+        ),
+    )
+    total_gpu_power_limit: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Total GPU power budget in watts for this DGD. Required when "
+            "enable_power_awareness=True; changing it requires a Planner "
+            "restart. Recommended formula: "
+            "(rack_capacity_W × headroom_factor) − non_gpu_overhead with "
+            "headroom_factor ≈ 0.85–0.9. Used for the power-budget gauges and "
+            "as the projected ceiling the final budget clamp holds scaling to — "
+            "a bound on projected draw from the requested caps, not a proven "
+            "hardware limit (see the Power Agent for effective enforcement)."
+        ),
+    )
 
     # Diagnostics report settings
     report_interval_hours: Optional[float] = Field(
@@ -648,18 +794,16 @@ class PlannerConfig(BaseModel):
         default=8080,
         description=(
             "Port for the live diagnostics dashboard HTTP server. "
-            "Set to 0 to disable. When enabled, visit http://host:port/ "
-            "to view a real-time Plotly report of accumulated snapshots."
+            "Set to 0 to disable. When enabled, visit "
+            "http://<host>:<port>/ to view a real-time Plotly report of "
+            "accumulated snapshots."
         ),
     )
 
     scheduling: SchedulingConfig = Field(
         default_factory=SchedulingConfig,
         description=(
-            "Tick-engine scheduling config — see ``SchedulingConfig`` "
-            "docstring. Default uses the legacy PSM path; set "
-            "``scheduling.use_orchestrator=true`` to opt into the "
-            "orchestrator path."
+            "Plugin-pipeline scheduling config — see ``SchedulingConfig`` docstring."
         ),
     )
 
@@ -677,10 +821,83 @@ class PlannerConfig(BaseModel):
         ),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_scale_interval_from_builtin_intervals(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        scheduling = data.get("scheduling")
+        if isinstance(scheduling, dict) and "scale_interval_seconds" in scheduling:
+            return data
+        if scheduling is not None and not isinstance(scheduling, dict):
+            return data
+
+        load_interval = data.get(
+            "load_adjustment_interval_seconds",
+            data.get(
+                "load_adjustment_interval",
+                SLAPlannerDefaults.load_adjustment_interval_seconds,
+            ),
+        )
+        if load_interval is None:
+            return data
+        raw_throughput_enabled = data.get(
+            "enable_throughput_scaling",
+            SLAPlannerDefaults.enable_throughput_scaling,
+        )
+        if isinstance(raw_throughput_enabled, str):
+            throughput_enabled = raw_throughput_enabled.lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        else:
+            throughput_enabled = bool(raw_throughput_enabled)
+        optimization_target = data.get("optimization_target", "throughput")
+        throughput_enabled = throughput_enabled and optimization_target == "sla"
+        try:
+            intervals = [float(load_interval)]
+        except (TypeError, ValueError):
+            return data
+        if throughput_enabled:
+            throughput_interval = data.get(
+                "throughput_adjustment_interval_seconds",
+                data.get(
+                    "throughput_adjustment_interval",
+                    SLAPlannerDefaults.throughput_adjustment_interval_seconds,
+                ),
+            )
+            if throughput_interval is None:
+                return data
+            try:
+                intervals.append(float(throughput_interval))
+            except (TypeError, ValueError):
+                return data
+
+        updated = dict(data)
+        updated_scheduling = dict(scheduling or {})
+        updated_scheduling["scale_interval_seconds"] = _gcd_seconds(intervals)
+        updated["scheduling"] = updated_scheduling
+        return updated
+
     @model_validator(mode="after")
     def _validate_config(self) -> "PlannerConfig":
         if self.ttft_ms <= 0:
             raise ValueError(f"ttft_ms must be > 0, got {self.ttft_ms}")
+
+        if self.mode == "prefill" and self.decode_min_endpoint is not None:
+            raise ValueError("decode_min_endpoint is not supported when mode='prefill'")
+        if self.mode == "decode" and self.prefill_min_endpoint is not None:
+            raise ValueError("prefill_min_endpoint is not supported when mode='decode'")
+        if self.mode == "agg" and (
+            self.prefill_min_endpoint is not None
+            or self.decode_min_endpoint is not None
+        ):
+            raise ValueError(
+                "prefill_min_endpoint and decode_min_endpoint are not supported "
+                "when mode='agg'; use min_endpoint"
+            )
 
         if self.report_interval_hours is not None:
             if (
@@ -697,6 +914,33 @@ class PlannerConfig(BaseModel):
                 f"fpm_sample_bucket_size must be a perfect square, "
                 f"got {self.fpm_sample_bucket_size}"
             )
+
+        # Power-awareness validation. Per-GPU caps come from operator-projected
+        # DGD component status, not this config, so the only required knob is
+        # the total budget — and a Kubernetes connector to read the DGD.
+        if self.enable_power_awareness:
+            if self.total_gpu_power_limit is None:
+                raise ValueError(
+                    "total_gpu_power_limit is required when enable_power_awareness=True. "
+                    "Recommended: (rack_capacity_W × headroom_factor) − non_gpu_overhead "
+                    "with headroom_factor ≈ 0.85–0.9. Setting this incorrectly "
+                    "could silently cap your cluster — there is no safe default."
+                )
+            if self.environment != "kubernetes":
+                raise ValueError(
+                    "enable_power_awareness=True requires environment='kubernetes'. "
+                    "Per-GPU caps are read from DGD component status, which only "
+                    "the Kubernetes connector resolves; virtual/replay and "
+                    "global-planner modes have no DGD with authoritative caps."
+                )
+            if self.mode == "agg":
+                raise ValueError(
+                    "enable_power_awareness=True is not supported with mode='agg'. "
+                    "The Kubernetes deployment-validation and GPU-count paths use the "
+                    "typed decode role resolver, which does not follow the generic "
+                    "type:worker fallback used by the power parser. Power awareness "
+                    "is supported for mode='disagg', 'prefill', and 'decode'."
+                )
 
         if self.environment == "global-planner" and not self.global_planner_namespace:
             raise ValueError(
@@ -773,8 +1017,8 @@ class PlannerConfig(BaseModel):
             ):
                 logger.warning(
                     "pre_deployment_sweeping_mode is 'none' or unset while "
-                    "throughput scaling is enabled; the Rust engine perf model "
-                    "will start from native AIC estimates when available or "
+                    "throughput scaling is enabled; the AISimulate performance model "
+                    "will start from native AISimulate estimates when available or "
                     "from live FPM regression after enough observations."
                 )
             if (
@@ -783,27 +1027,38 @@ class PlannerConfig(BaseModel):
             ):
                 logger.warning(
                     "pre_deployment_sweeping_mode='rapid' but aic_interpolation "
-                    "is not set; planner will use aic_perf_model, live FPM "
+                    "is not set; planner will use ais_perf_model, live FPM "
                     "tuning, or profile_results_dir files if the "
                     "get_perf_metrics endpoint is unavailable."
                 )
 
-        if self.aic_perf_model is not None:
-            if (
-                self.mode in ("disagg", "prefill")
-                and self.aic_perf_model.prefill_pick is None
-            ):
+        if self.ais_perf_model is not None:
+            required_roles = {
+                "disagg": ("prefill", "decode"),
+                "prefill": ("prefill",),
+                "decode": ("decode",),
+                "agg": ("aggregated",),
+            }[self.mode]
+            for role in required_roles:
+                if role not in self.ais_perf_model.roles:
+                    raise ValueError(
+                        f"ais_perf_model.roles.{role} is required for mode={self.mode!r}"
+                    )
+
+        intervals = [float(self.load_adjustment_interval_seconds)]
+        if self.enable_throughput_scaling:
+            if self.throughput_adjustment_interval_seconds <= 0:
                 raise ValueError(
-                    "aic_perf_model.prefill_pick is required for prefill "
-                    f"perf queries in mode={self.mode!r}"
+                    "throughput_adjustment_interval_seconds must be > 0 "
+                    "when throughput scaling is enabled"
                 )
-            if (
-                self.mode in ("disagg", "decode", "agg")
-                and self.aic_perf_model.decode_pick is None
-            ):
+            intervals.append(float(self.throughput_adjustment_interval_seconds))
+        for interval in intervals:
+            if not _is_multiple_of(interval, self.scheduling.scale_interval_seconds):
                 raise ValueError(
-                    "aic_perf_model.decode_pick is required for decode/agg "
-                    f"perf queries in mode={self.mode!r}"
+                    "scheduling.scale_interval_seconds must evenly divide "
+                    "load_adjustment_interval_seconds and, when throughput "
+                    "scaling is enabled, throughput_adjustment_interval_seconds"
                 )
 
         if self.enable_load_scaling:
@@ -873,6 +1128,30 @@ class PlannerConfig(BaseModel):
 
     def scaling_enabled(self) -> bool:
         return self.enable_throughput_scaling or self.enable_load_scaling
+
+    @property
+    def effective_prefill_min_endpoint(self) -> int:
+        """Return the effective prefill endpoint minimum."""
+
+        return resolve_min_endpoint(self, "prefill")
+
+    @property
+    def effective_decode_min_endpoint(self) -> int:
+        """Return the effective decode endpoint minimum."""
+
+        return resolve_min_endpoint(self, "decode")
+
+    def active_min_endpoints(self) -> tuple[Optional[int], Optional[int]]:
+        """Return effective ``(prefill, decode)`` floors for the active mode."""
+
+        if self.mode == "prefill":
+            return self.effective_prefill_min_endpoint, None
+        if self.mode in ("decode", "agg"):
+            return None, self.effective_decode_min_endpoint
+        return (
+            self.effective_prefill_min_endpoint,
+            self.effective_decode_min_endpoint,
+        )
 
 
 if __name__ == "__main__":

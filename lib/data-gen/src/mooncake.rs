@@ -5,19 +5,17 @@
 //!
 //! This module is producer- and consumer-agnostic: it defines the row schema,
 //! the block-hash-to-id mapping, the token-block hashing helper, and the JSONL
-//! writer. Workload-specific orchestration (session scheduling, tokenization,
-//! parsing) lives elsewhere -- the Claude exporter in `dynamo-bench` is one
-//! such producer; the `dynamo-mocker` load generator is one such consumer.
+//! writer. Workload-specific orchestration such as scheduling, tokenization,
+//! and parsing lives elsewhere.
 //!
 //! The [`MooncakeRow`] schema deliberately matches the externally-authored
 //! Mooncake trace format: `timestamp` and `delay` are `f64` milliseconds, and
 //! `input_length`/`output_length`/`timestamp`/`delay` accept the upstream
 //! aliases (`input_tokens`, `output_tokens`, `created_time`, `delay_ms`) on
-//! deserialization. Dynamo-produced traces always emit the canonical names.
+//! deserialization. Serialization emits the canonical names.
 
 use anyhow::{Context, Result, bail};
-use bytemuck::cast_slice;
-use dynamo_tokens::compute_hash_v2;
+use dynamo_kv_hashing::{Request, compute_hash_v2, compute_next_sequence_hash, compute_salt_hash};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -35,14 +33,18 @@ use std::path::Path;
 /// producers and consumers. Field-level aliases on deserialization accept the
 /// upstream Mooncake field names (`input_tokens`, `output_tokens`,
 /// `created_time`, `delay_ms`) without requiring producers to emit them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MooncakeRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, alias = "input_tokens")]
     pub input_length: Option<usize>,
     #[serde(default, alias = "output_tokens")]
     pub output_length: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_ids: Option<Vec<u32>>,
     #[serde(default)]
     pub hash_ids: Option<Vec<u64>>,
     #[serde(
@@ -53,70 +55,86 @@ pub struct MooncakeRow {
     pub timestamp: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "delay_ms")]
     pub delay: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_priority: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_class: Option<String>,
 }
 
-/// One row of an agentic Mooncake replay trace.
-///
-/// This format keeps the request/cache fields from [`MooncakeRow`] and adds a
-/// tiny workflow layer above them. `request_id` names the row. `wait_for` names
-/// request ids whose simulated completions must arrive before this row becomes
-/// eligible. Once all dependencies are satisfied, replay waits `delay` plus
-/// `tool_wait_ms` before dispatching the request. Rows with no dependencies
-/// use `timestamp` as their open-loop start time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub const AGENTIC_MOONCAKE_SCHEMA: &str = "dynamo.agentic_mooncake";
+pub const AGENTIC_MOONCAKE_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgenticSourceProvenance {
+    pub format: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticHashIdScope {
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgenticMooncakeHeader {
+    pub schema: String,
+    pub version: u32,
+    pub block_size: usize,
+    pub hash_id_scope: AgenticHashIdScope,
+    pub source: AgenticSourceProvenance,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticDependencyTrigger {
+    Dispatch,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticDependencyRelation {
+    Sequence,
+    Spawn,
+    Join,
+    ReplayBarrier,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgenticDependency {
+    pub request_id: String,
+    pub trigger: AgenticDependencyTrigger,
+    pub delay_ms: f64,
+    pub relation: AgenticDependencyRelation,
+}
+
+/// One request row in the versioned Agentic Mooncake wire format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgenticMooncakeRow {
     pub request_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub play_id: String,
+    pub session_id: String,
+    pub model: String,
     #[serde(default, alias = "input_tokens")]
     pub input_length: Option<usize>,
     #[serde(default, alias = "output_tokens")]
     pub output_length: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_ids: Option<Vec<u32>>,
     #[serde(default)]
     pub hash_ids: Option<Vec<u64>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "created_time"
-    )]
-    pub timestamp: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "delay_ms")]
-    pub delay: Option<f64>,
+    pub not_before_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_priority: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_class: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub wait_for: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub branches: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix_reset: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_wait_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_events: Vec<AgenticToolEvent>,
-}
-
-impl AgenticMooncakeRow {
-    /// Return the total wait after all dependencies complete.
-    pub fn dependency_delay_ms(&self) -> f64 {
-        self.delay.unwrap_or(0.0) + self.tool_wait_ms.unwrap_or(0.0)
-    }
-}
-
-/// Harness tool span attributed to the LLM request that consumed it. Mirrors
-/// `tool_end` / `tool_error` fields from `dynamo.agent.trace.v1`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgenticToolEvent {
-    pub tool_call_id: String,
-    pub tool_class: String,
-    pub started_at_unix_ms: u64,
-    pub ended_at_unix_ms: u64,
-    pub duration_ms: f64,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_type: Option<String>,
+    pub dependencies: Vec<AgenticDependency>,
 }
 
 /// Maps sequence-aware block hashes to compact, stable `u64` ids.
@@ -152,12 +170,18 @@ impl RollingHashIdMapper {
 
     /// Hash a sequence of tokens into Mooncake `hash_ids`.
     ///
-    /// Tokens are chunked by `block_size`; each block contributes one id. The
-    /// chained hash mixes the prior block's combined hash, so identical
-    /// prefixes across requests resolve to identical leading `hash_ids` once
-    /// the mapper has seen them.
+    /// Tokens are chunked by `block_size`; each complete block contributes one
+    /// compact id derived from Dynamo's shared KV-hashing contract. A trailing
+    /// partial block also contributes one compact id so replay capacity still
+    /// covers the full prompt length. Identical prefixes across requests
+    /// resolve to identical leading `hash_ids` once the mapper has seen them.
     pub fn hash_token_blocks(&mut self, tokens: &[u32]) -> Vec<u64> {
         hash_token_blocks(self, tokens)
+    }
+
+    /// Fallible variant of [`Self::hash_token_blocks`].
+    pub fn try_hash_token_blocks(&mut self, tokens: &[u32]) -> Result<Vec<u64>> {
+        try_hash_token_blocks(self, tokens)
     }
 
     /// Map precomputed sequence-aware block hashes into compact Mooncake IDs.
@@ -171,27 +195,106 @@ impl RollingHashIdMapper {
 
 /// Token-block hashing helper for the Mooncake replay schema.
 ///
-/// Splits `tokens` into chunks of `mapper.block_size()`, computes a chained
-/// hash per block, and returns the compact ids assigned by `mapper`. Mirrors
+/// Splits `tokens` into chunks of `mapper.block_size()`, derives sequence-aware
+/// hashes for complete blocks through `dynamo-kv-hashing`, appends a sequence
+/// hash for a trailing partial block when present, and returns the
+/// compact ids assigned by `mapper`. Mirrors
 /// [`RollingHashIdMapper::hash_token_blocks`] as a free function so callers
 /// that already hold a mutable mapper reference can invoke it without
 /// re-borrowing.
 pub fn hash_token_blocks(mapper: &mut RollingHashIdMapper, tokens: &[u32]) -> Vec<u64> {
-    let block_size = mapper.block_size;
-    let mut hash_ids = Vec::with_capacity(tokens.len().div_ceil(block_size));
-    let mut parent_hash = 0_u64;
-    for block in tokens.chunks(block_size) {
-        let block_hash = compute_hash_v2(cast_slice(block), 0);
-        let combined_hash = compute_hash_v2(&block_hash.to_be_bytes(), parent_hash);
-        let id = *mapper.hash_to_id.entry(combined_hash).or_insert_with(|| {
-            let next_id = mapper.next_id;
-            mapper.next_id += 1;
-            next_id
-        });
-        hash_ids.push(id);
-        parent_hash = combined_hash;
+    try_hash_token_blocks(mapper, tokens).expect("Mooncake token-block hashing failed")
+}
+
+/// Fallible token-block hashing helper for callers that want to surface
+/// invalid block-size or request-shape errors.
+pub fn try_hash_token_blocks(mapper: &mut RollingHashIdMapper, tokens: &[u32]) -> Result<Vec<u64>> {
+    let sequence_hashes = sequence_hashes_for_tokens(tokens, mapper.block_size)?;
+    Ok(ids_for_sequence_hashes(mapper, &sequence_hashes))
+}
+
+/// Derive the sequence-aware block hashes recorded by Dynamo request traces.
+pub fn sequence_hashes_for_tokens(tokens: &[u32], block_size: usize) -> Result<Vec<u64>> {
+    require_positive("block size", block_size)?;
+    let block_size_u32: u32 = block_size
+        .try_into()
+        .context("block_size does not fit u32")?;
+    let request = Request::builder().tokens(tokens.to_vec()).build()?;
+    let salt_hash = request.salt_hash()?;
+    let mut sequence_hashes = request.into_sequence_hashes(block_size_u32)?;
+    if let Some(partial_hash) =
+        trailing_partial_sequence_hash(salt_hash, block_size, tokens, &sequence_hashes)
+    {
+        sequence_hashes.push(partial_hash);
     }
-    hash_ids
+    Ok(sequence_hashes)
+}
+
+/// Extends reusable full-block sequence hashes to cover `tokens`.
+///
+/// `prefix_hashes` must be the leading full-block hashes that [`sequence_hashes_for_tokens`]
+/// returns for `tokens`. Only the remaining blocks are hashed, and the result equals
+/// `sequence_hashes_for_tokens(tokens, block_size)`.
+pub fn extend_sequence_hashes(
+    prefix_hashes: &[u64],
+    tokens: &[u32],
+    block_size: usize,
+) -> Result<Vec<u64>> {
+    require_positive("block size", block_size)?;
+    let full_blocks = tokens.len() / block_size;
+    if prefix_hashes.len() > full_blocks {
+        bail!(
+            "{} reusable sequence hashes exceed {full_blocks} full blocks",
+            prefix_hashes.len()
+        );
+    }
+    let salt_hash = compute_salt_hash(None, None)?;
+    let mut sequence_hashes = Vec::with_capacity(full_blocks + 1);
+    sequence_hashes.extend_from_slice(prefix_hashes);
+    let mut block_bytes = Vec::with_capacity(block_size * std::mem::size_of::<u32>());
+    for block in
+        tokens[prefix_hashes.len() * block_size..full_blocks * block_size].chunks_exact(block_size)
+    {
+        block_bytes.clear();
+        for token in block {
+            block_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        let block_hash = compute_hash_v2(&block_bytes, salt_hash);
+        let sequence_hash = match sequence_hashes.last() {
+            Some(parent) => compute_next_sequence_hash(*parent, block_hash),
+            None => block_hash,
+        };
+        sequence_hashes.push(sequence_hash);
+    }
+    if let Some(partial_hash) =
+        trailing_partial_sequence_hash(salt_hash, block_size, tokens, &sequence_hashes)
+    {
+        sequence_hashes.push(partial_hash);
+    }
+    Ok(sequence_hashes)
+}
+
+fn trailing_partial_sequence_hash(
+    salt_hash: u64,
+    block_size: usize,
+    tokens: &[u32],
+    complete_sequence_hashes: &[u64],
+) -> Option<u64> {
+    let tail_len = tokens.len() % block_size;
+    if tail_len == 0 {
+        return None;
+    }
+
+    let tail = &tokens[tokens.len() - tail_len..];
+    let mut tail_bytes = Vec::with_capacity(std::mem::size_of_val(tail));
+    for token in tail {
+        tail_bytes.extend_from_slice(&token.to_ne_bytes());
+    }
+    let tail_block_hash = compute_hash_v2(&tail_bytes, salt_hash);
+    Some(match complete_sequence_hashes.last().copied() {
+        Some(parent) => compute_next_sequence_hash(parent, tail_block_hash),
+        None => tail_block_hash,
+    })
 }
 
 /// Map stable sequence hashes to compact Mooncake IDs with a shared mapper.
@@ -229,6 +332,7 @@ pub struct MooncakeJsonlWriter {
     output: BufWriter<File>,
     sidecar: Option<BufWriter<File>>,
     stats: WriterStats,
+    agentic_header_written: bool,
 }
 
 impl MooncakeJsonlWriter {
@@ -256,19 +360,36 @@ impl MooncakeJsonlWriter {
             output,
             sidecar,
             stats: WriterStats::default(),
+            agentic_header_written: false,
         })
     }
 
     /// Append one Mooncake row.
     pub fn write_row(&mut self, row: &MooncakeRow) -> Result<()> {
+        if self.agentic_header_written {
+            bail!("standard Mooncake rows cannot follow an agentic Mooncake v2 header");
+        }
         serde_json::to_writer(&mut self.output, row)?;
         self.output.write_all(b"\n")?;
         self.stats.row_count += 1;
         Ok(())
     }
 
-    /// Append one agentic Mooncake row.
+    pub fn write_agentic_header(&mut self, header: &AgenticMooncakeHeader) -> Result<()> {
+        if self.agentic_header_written || self.stats.row_count != 0 {
+            bail!("agentic Mooncake header must be the first JSONL record");
+        }
+        serde_json::to_writer(&mut self.output, header)?;
+        self.output.write_all(b"\n")?;
+        self.agentic_header_written = true;
+        Ok(())
+    }
+
+    /// Append one agentic Mooncake row after its required v2 header.
     pub fn write_agentic_row(&mut self, row: &AgenticMooncakeRow) -> Result<()> {
+        if !self.agentic_header_written {
+            bail!("agentic Mooncake row requires a preceding v2 header");
+        }
         serde_json::to_writer(&mut self.output, row)?;
         self.output.write_all(b"\n")?;
         self.stats.row_count += 1;
@@ -343,6 +464,32 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn extended_sequence_hashes_match_full_hashing() {
+        let mut state = 0x9e37_79b9_u32;
+        let tokens = (0..300)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state
+            })
+            .collect::<Vec<_>>();
+        for block_size in [1, 3, 64] {
+            for length in [0, 1, 2, 63, 64, 65, 128, 191, 300] {
+                let tokens = &tokens[..length];
+                let expected = sequence_hashes_for_tokens(tokens, block_size).unwrap();
+                for reused in 0..=length / block_size {
+                    let extended =
+                        extend_sequence_hashes(&expected[..reused], tokens, block_size).unwrap();
+                    assert_eq!(
+                        extended, expected,
+                        "block={block_size} len={length} reused={reused}"
+                    );
+                }
+            }
+        }
+        assert!(extend_sequence_hashes(&[1, 2], &tokens[..3], 2).is_err());
+    }
+
+    #[test]
     fn shared_prefix_yields_shared_leading_hash_ids() {
         let mut mapper = RollingHashIdMapper::new(2);
         let prefix = vec![1u32, 2, 3, 4];
@@ -388,9 +535,61 @@ mod tests {
     }
 
     #[test]
+    fn exact_token_blocks_match_shared_kv_hashing_contract() {
+        let tokens = vec![7u32, 8, 9, 10, 11, 12, 13, 14];
+        let request = Request::builder().tokens(tokens.clone()).build().unwrap();
+        let expected = request.into_sequence_hashes(4).unwrap();
+
+        assert_eq!(sequence_hashes_for_tokens(&tokens, 4).unwrap(), expected);
+    }
+
+    #[test]
     fn empty_token_input_yields_empty_hash_ids() {
         let mut mapper = RollingHashIdMapper::new(4);
         assert!(mapper.hash_token_blocks(&[]).is_empty());
+    }
+
+    #[test]
+    fn trailing_partial_block_preserves_replay_capacity() {
+        let mut mapper = RollingHashIdMapper::new(4);
+
+        assert_eq!(mapper.hash_token_blocks(&[1, 2, 3]), vec![0]);
+        assert_eq!(mapper.hash_token_blocks(&[1, 2, 3, 4, 5, 6]), vec![1, 2]);
+    }
+
+    #[test]
+    fn trailing_partial_block_uses_shared_chain_contract() {
+        let tokens = vec![1u32, 2, 3, 4, 5, 6];
+        let request = Request::builder().tokens(tokens.clone()).build().unwrap();
+        let salt_hash = request.salt_hash().unwrap();
+        let mut expected = request.into_sequence_hashes(4).unwrap();
+        let mut tail_bytes = Vec::new();
+        for token in &tokens[4..] {
+            tail_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        let tail_block_hash = compute_hash_v2(&tail_bytes, salt_hash);
+        expected.push(compute_next_sequence_hash(expected[0], tail_block_hash));
+
+        assert_eq!(sequence_hashes_for_tokens(&tokens, 4).unwrap(), expected);
+    }
+
+    #[test]
+    fn exact_block_boundary_does_not_add_partial_hash_id() {
+        let mut mapper = RollingHashIdMapper::new(4);
+
+        assert_eq!(mapper.hash_token_blocks(&[1, 2, 3, 4]), vec![0]);
+        assert_eq!(
+            mapper.hash_token_blocks(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn try_hash_token_blocks_rejects_zero_block_size() {
+        let mut mapper = RollingHashIdMapper::new(0);
+        let err = mapper.try_hash_token_blocks(&[1, 2, 3]).unwrap_err();
+
+        assert!(err.to_string().contains("block size"));
     }
 
     #[test]
@@ -413,6 +612,7 @@ mod tests {
             hash_ids: Some(vec![0, 1]),
             timestamp: None,
             delay: None,
+            ..Default::default()
         };
         let rendered: Value = serde_json::to_value(&row).unwrap();
         assert!(rendered.get("timestamp").is_none());
@@ -429,6 +629,7 @@ mod tests {
             hash_ids: Some(vec![]),
             timestamp: Some(0.0),
             delay: None,
+            ..Default::default()
         };
         let with_delay = MooncakeRow {
             session_id: Some("s".to_string()),
@@ -437,6 +638,7 @@ mod tests {
             hash_ids: Some(vec![]),
             timestamp: None,
             delay: Some(123.0),
+            ..Default::default()
         };
         let v_ts: Value = serde_json::to_value(&with_timestamp).unwrap();
         let v_dl: Value = serde_json::to_value(&with_delay).unwrap();
@@ -469,6 +671,78 @@ mod tests {
     }
 
     #[test]
+    fn row_alias_input_round_trips_to_canonical_fields() {
+        let raw = r#"{"input_tokens":8,"output_tokens":2,"created_time":12.5,"delay_ms":3.0}"#;
+        let mut row: MooncakeRow = serde_json::from_str(raw).unwrap();
+
+        let tokens: Vec<u32> = (0..row.input_length.unwrap() as u32).collect();
+        let mut mapper = RollingHashIdMapper::new(4);
+        row.hash_ids = Some(mapper.hash_token_blocks(&tokens));
+
+        let rendered: Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(rendered["input_length"], json!(8));
+        assert_eq!(rendered["output_length"], json!(2));
+        assert_eq!(rendered["timestamp"], json!(12.5));
+        assert_eq!(rendered["delay"], json!(3.0));
+        assert_eq!(rendered["hash_ids"], json!([0, 1]));
+        assert!(rendered.get("input_tokens").is_none());
+        assert!(rendered.get("output_tokens").is_none());
+        assert!(rendered.get("created_time").is_none());
+        assert!(rendered.get("delay_ms").is_none());
+    }
+
+    #[test]
+    fn row_replay_fields_round_trip_canonical_and_alias_inputs() {
+        let canonical = r#"{"request_id":"r1","session_id":"s","input_length":8,"output_length":3,"output_token_ids":[101,102,103],"hash_ids":[0,1],"timestamp":12.5,"delay":3.0}"#;
+        let row: MooncakeRow = serde_json::from_str(canonical).unwrap();
+        assert_eq!(row.request_id.as_deref(), Some("r1"));
+        assert_eq!(row.output_length, Some(3));
+        assert_eq!(row.output_token_ids, Some(vec![101, 102, 103]));
+
+        let rendered: Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(rendered["request_id"], json!("r1"));
+        assert_eq!(rendered["output_token_ids"], json!([101, 102, 103]));
+        let decoded: MooncakeRow = serde_json::from_value(rendered).unwrap();
+        assert_eq!(decoded.request_id.as_deref(), Some("r1"));
+        assert_eq!(decoded.output_token_ids, Some(vec![101, 102, 103]));
+
+        let aliased = r#"{"request_id":"r2","input_tokens":4,"output_tokens":2,"output_token_ids":[201,202],"hash_ids":[7],"created_time":1.5,"delay_ms":0.5}"#;
+        let row: MooncakeRow = serde_json::from_str(aliased).unwrap();
+        assert_eq!(row.request_id.as_deref(), Some("r2"));
+        assert_eq!(row.input_length, Some(4));
+        assert_eq!(row.output_length, Some(2));
+        assert_eq!(row.output_token_ids, Some(vec![201, 202]));
+
+        let rendered: Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(rendered["input_length"], json!(4));
+        assert_eq!(rendered["output_length"], json!(2));
+        assert_eq!(rendered["output_token_ids"], json!([201, 202]));
+        assert!(rendered.get("input_tokens").is_none());
+        assert!(rendered.get("output_tokens").is_none());
+    }
+
+    #[test]
+    fn row_canonical_input_round_trips_without_renaming() {
+        let raw = r#"{"input_length":8,"output_length":2,"timestamp":12.5,"delay":3.0}"#;
+        let mut row: MooncakeRow = serde_json::from_str(raw).unwrap();
+
+        let tokens: Vec<u32> = (0..row.input_length.unwrap() as u32).collect();
+        let mut mapper = RollingHashIdMapper::new(4);
+        row.hash_ids = Some(mapper.hash_token_blocks(&tokens));
+
+        let rendered: Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(rendered["input_length"], json!(8));
+        assert_eq!(rendered["output_length"], json!(2));
+        assert_eq!(rendered["timestamp"], json!(12.5));
+        assert_eq!(rendered["delay"], json!(3.0));
+        assert_eq!(rendered["hash_ids"], json!([0, 1]));
+        assert!(rendered.get("input_tokens").is_none());
+        assert!(rendered.get("output_tokens").is_none());
+        assert!(rendered.get("created_time").is_none());
+        assert!(rendered.get("delay_ms").is_none());
+    }
+
+    #[test]
     fn row_deserializes_with_missing_optional_fields() {
         let raw = r#"{"output_length":2}"#;
         let row: MooncakeRow = serde_json::from_str(raw).unwrap();
@@ -478,78 +752,64 @@ mod tests {
         assert_eq!(row.hash_ids, None);
         assert_eq!(row.timestamp, None);
         assert_eq!(row.delay, None);
+        assert_eq!(row.priority, None);
+        assert_eq!(row.strict_priority, None);
+        assert_eq!(row.policy_class, None);
+        let rendered: Value = serde_json::to_value(&row).unwrap();
+        assert!(rendered.get("priority").is_none());
+        assert!(rendered.get("strict_priority").is_none());
+        assert!(rendered.get("policy_class").is_none());
+        assert!(rendered.get("request_id").is_none());
+        assert!(rendered.get("output_token_ids").is_none());
     }
 
     #[test]
-    fn agentic_row_defaults_workflow_fields() {
-        let raw = r#"{"request_id":"r1","input_length":4,"output_length":1,"hash_ids":[0,1],"timestamp":10.0}"#;
+    fn row_round_trips_priorities() {
+        for priority in [Some(7), Some(0), Some(-3)] {
+            let raw = json!({
+                "output_length": 2,
+                "priority": priority,
+                "strict_priority": 9,
+                "policy_class": "latency"
+            });
+            let row: MooncakeRow = serde_json::from_value(raw).unwrap();
+            assert_eq!(row.priority, priority);
+            assert_eq!(row.strict_priority, Some(9));
+            assert_eq!(row.policy_class.as_deref(), Some("latency"));
+
+            let rendered: Value = serde_json::to_value(&row).unwrap();
+            assert_eq!(rendered["priority"], json!(priority.unwrap()));
+            assert_eq!(rendered["strict_priority"], json!(9));
+            assert_eq!(rendered["policy_class"], json!("latency"));
+        }
+    }
+
+    #[test]
+    fn agentic_v2_row_round_trips_typed_dependencies() {
+        let raw = r#"{"request_id":"r2","play_id":"play","session_id":"child","model":"model","input_length":4,"output_length":1,"hash_ids":[7],"not_before_ms":10.0,"dependencies":[{"request_id":"r1","trigger":"dispatch","delay_ms":3.0,"relation":"spawn"}]}"#;
         let row: AgenticMooncakeRow = serde_json::from_str(raw).unwrap();
 
-        assert_eq!(row.request_id, "r1");
-        assert!(row.wait_for.is_empty());
-        assert!(row.branches.is_empty());
-        assert_eq!(row.prefix_reset, None);
-        assert_eq!(row.dependency_delay_ms(), 0.0);
-    }
-
-    #[test]
-    fn agentic_row_delay_includes_tool_wait() {
-        let row = AgenticMooncakeRow {
-            request_id: "r2".to_string(),
-            session_id: Some("trajectory-a".to_string()),
-            input_length: Some(4),
-            output_length: Some(1),
-            hash_ids: Some(vec![0, 1]),
-            timestamp: Some(20.0),
-            delay: Some(3.0),
-            wait_for: vec!["r1".to_string()],
-            branches: vec!["r3".to_string()],
-            prefix_reset: Some(false),
-            tool_wait_ms: Some(7.0),
-            tool_events: Vec::new(),
-        };
-
-        assert_eq!(row.dependency_delay_ms(), 10.0);
+        assert_eq!(row.play_id, "play");
+        assert_eq!(row.model, "model");
+        assert_eq!(row.dependencies.len(), 1);
+        assert_eq!(
+            row.dependencies[0].trigger,
+            AgenticDependencyTrigger::Dispatch
+        );
+        assert_eq!(
+            row.dependencies[0].relation,
+            AgenticDependencyRelation::Spawn
+        );
+        assert_eq!(row.dependencies[0].delay_ms, 3.0);
         let rendered: Value = serde_json::to_value(&row).unwrap();
-        assert_eq!(rendered["request_id"], json!("r2"));
-        assert_eq!(rendered["wait_for"], json!(["r1"]));
-        assert_eq!(rendered["branches"], json!(["r3"]));
-        assert_eq!(rendered["tool_wait_ms"], json!(7.0));
-        assert!(rendered.get("tool_events").is_none());
+        assert_eq!(rendered["not_before_ms"], json!(10.0));
+        assert_eq!(rendered["dependencies"][0]["trigger"], json!("dispatch"));
     }
 
     #[test]
-    fn agentic_row_round_trips_tool_events() {
-        let row = AgenticMooncakeRow {
-            request_id: "r1".to_string(),
-            session_id: Some("trajectory-a".to_string()),
-            input_length: Some(4),
-            output_length: Some(1),
-            hash_ids: Some(vec![0, 1]),
-            timestamp: Some(0.0),
-            delay: Some(0.0),
-            wait_for: Vec::new(),
-            branches: Vec::new(),
-            prefix_reset: Some(true),
-            tool_wait_ms: Some(8.0),
-            tool_events: vec![AgenticToolEvent {
-                tool_call_id: "call-1".to_string(),
-                tool_class: "web_search".to_string(),
-                started_at_unix_ms: 1_000,
-                ended_at_unix_ms: 1_008,
-                duration_ms: 8.0,
-                status: "succeeded".to_string(),
-                output_bytes: Some(512),
-                output_tokens: None,
-                error_type: None,
-            }],
-        };
-
-        let rendered = serde_json::to_string(&row).unwrap();
-        let decoded: AgenticMooncakeRow = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(decoded.tool_events.len(), 1);
-        assert_eq!(decoded.tool_events[0].tool_class, "web_search");
-        assert_eq!(decoded.tool_events[0].output_bytes, Some(512));
+    fn agentic_row_rejects_header_fields_by_shape() {
+        let raw = r#"{"request_id":"r1","input_length":4,"output_length":1,"hash_ids":[0],"timestamp":10.0}"#;
+        assert!(serde_json::from_str::<AgenticMooncakeRow>(raw).is_err());
     }
 
     #[test]
@@ -567,6 +827,7 @@ mod tests {
                 hash_ids: Some(vec![0]),
                 timestamp: Some(0.0),
                 delay: None,
+                ..Default::default()
             })
             .unwrap();
         writer.write_sidecar(&json!({"k": "v"})).unwrap();
@@ -597,19 +858,28 @@ mod tests {
         let output = temp.path().join("agentic.jsonl");
         let mut writer = MooncakeJsonlWriter::create(&output, None).unwrap();
         writer
+            .write_agentic_header(&AgenticMooncakeHeader {
+                schema: AGENTIC_MOONCAKE_SCHEMA.to_string(),
+                version: AGENTIC_MOONCAKE_VERSION,
+                block_size: 2,
+                hash_id_scope: AgenticHashIdScope::Local,
+                source: AgenticSourceProvenance {
+                    format: "test".to_string(),
+                    digest: "digest".to_string(),
+                },
+            })
+            .unwrap();
+        writer
             .write_agentic_row(&AgenticMooncakeRow {
                 request_id: "r1".to_string(),
-                session_id: None,
+                play_id: "play".to_string(),
+                session_id: "session".to_string(),
+                model: "model".to_string(),
                 input_length: Some(2),
                 output_length: Some(1),
                 hash_ids: Some(vec![0]),
-                timestamp: Some(0.0),
-                delay: None,
-                wait_for: Vec::new(),
-                branches: Vec::new(),
-                prefix_reset: Some(true),
-                tool_wait_ms: None,
-                tool_events: Vec::new(),
+                not_before_ms: 0.0,
+                ..Default::default()
             })
             .unwrap();
         let stats = writer.finish().unwrap();
@@ -620,8 +890,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(row_lines[0]["request_id"], json!("r1"));
-        assert_eq!(row_lines[0]["prefix_reset"], json!(true));
+        assert_eq!(row_lines.len(), 2);
+        assert_eq!(row_lines[0]["version"], json!(2));
+        assert_eq!(row_lines[1]["request_id"], json!("r1"));
     }
 
     #[test]

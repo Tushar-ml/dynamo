@@ -23,8 +23,10 @@ class ScheduledTick:
     """Declares when the core next needs to be called, what data it needs,
     and what decisions to make.
 
-    All times are absolute seconds (wall clock for native adapter,
-    simulated clock for replay).
+    ``at_s`` is an absolute wall-clock time for the native adapter and a
+    simulated time for replay. ``at_monotonic_s`` is the matching scheduler
+    timestamp used to make observation-prefetch and plugin-dispatch cadence
+    decisions against the same clock value.
     """
 
     at_s: float
@@ -35,9 +37,14 @@ class ScheduledTick:
 
     # What data the adapter should collect before calling on_tick
     need_traffic_metrics: bool = False
+    # True requests the full throughput traffic snapshot; False with
+    # need_traffic_metrics=True requests the cheaper load-only
+    # kv-hit-rate observation.
+    use_full_traffic_metrics: bool = False
     traffic_metrics_duration_s: float = 0.0
     need_worker_states: bool = False
     need_worker_fpm: bool = False
+    at_monotonic_s: Optional[float] = None
 
 
 @dataclass
@@ -49,6 +56,7 @@ class TrafficObservation:
     isl: float
     osl: float
     kv_hit_rate: Optional[float] = None
+    accept_length: Optional[float] = None
 
 
 @dataclass
@@ -61,6 +69,15 @@ class WorkerCounts:
     expected_num_decode: Optional[int] = None
     prefill_scaling_in_progress: bool = False
     decode_scaling_in_progress: bool = False
+    # Positive only when the connector has verified a scale-up with no drain,
+    # rollout, or unobserved spec update anywhere in the deployment.
+    pending_num_prefill: int = 0
+    pending_num_decode: int = 0
+
+    @property
+    def startup_in_progress(self) -> bool:
+        """True when verified startup-only inventory includes pending workers."""
+        return self.pending_num_prefill > 0 or self.pending_num_decode > 0
 
 
 @dataclass
@@ -97,7 +114,7 @@ class ScalingDecision:
 
 @dataclass
 class TickDiagnostics:
-    """Intermediate decision data populated by the state machine for
+    """Intermediate decision data populated by the planner core for
     observability.  The adapter layer reads these to set Prometheus
     metrics and feed the diagnostics recorder.
     """
@@ -106,7 +123,8 @@ class TickDiagnostics:
     estimated_ttft_ms: Optional[float] = None
     estimated_itl_ms: Optional[float] = None
 
-    # Throughput-scaling: predicted next-interval traffic
+    # Throughput-scaling: predicted next-interval traffic and last-value
+    # runtime metadata used by throughput decisions.
     predicted_num_req: Optional[float] = None
     predicted_isl: Optional[float] = None
     predicted_osl: Optional[float] = None
@@ -131,11 +149,9 @@ class TickDiagnostics:
     throughput_decision_reason_prefill: Optional[str] = None
     throughput_decision_reason_decode: Optional[str] = None
 
-    # Plugin-era fields below. Orchestrator path populates these; PSM
-    # path leaves them empty. Numeric fields above are the opposite —
-    # PSM populates them, orchestrator emits the same data as plugin-
-    # owned Prometheus metrics instead. Downstream readers must treat
-    # "empty" as "not available on this path".
+    # Plugin-pipeline fields below. Legacy callers that bypass the pipeline
+    # may leave them empty. Downstream readers must treat "empty" as
+    # "not available for this tick".
 
     # PROPOSE/RECONCILE/CONSTRAIN overrides contributed this tick.
     # Tuple: (plugin_id, stage, override_type, component_key, value).
@@ -159,8 +175,8 @@ class TickDiagnostics:
     # Pipeline execute_action — one of ``"apply"``,
     # ``"skip_short_circuit"``, ``"skip_no_targets"``,
     # ``"skip_tick_timeout"``.  Mirrors
-    # ``PipelineOutcome.execute_action``.  ``None`` on the PSM path
-    # (no pipeline).  Same information is also emitted as Prometheus
+    # ``PipelineOutcome.execute_action``. ``None`` means no pipeline action
+    # was recorded. Same information is also emitted as Prometheus
     # ``tick_skip_reasons_total`` etc., but exposing it on
     # ``PlannerEffects.diagnostics`` lets in-process consumers (replay
     # adapter, diagnostics recorder) see the action without scraping
@@ -174,7 +190,7 @@ class TickDiagnostics:
 
     # Audit-quality breadcrumbs emitted by the pipeline (chain-augment
     # warnings, CONSTRAIN SET drops, etc.).  Mirrors
-    # ``PipelineOutcome.audit_events``.  Empty list on the PSM path.
+    # ``PipelineOutcome.audit_events``.
     audit_events: list[str] = field(default_factory=list)
 
 
@@ -192,11 +208,25 @@ class EngineCapabilities:
     """Static capabilities for a single engine stage (prefill or decode)."""
 
     num_gpu: Optional[int] = None
+    gpu_cost_per_replica: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: Optional[int] = None
     context_length: Optional[int] = None
     max_kv_tokens: Optional[int] = None
     kv_cache_block_size: Optional[int] = None
+    speculative_nextn: Optional[int] = None
+    # DGD-resolved per-replica power draw (watts) for this stage: the per-GPU
+    # cap × the replica-wide GPU total. None when power awareness is off or the
+    # cap has not been resolved. The final budget clamp reads this.
+    power_watts_per_replica: Optional[int] = None
+
+    @property
+    def resolved_gpu_cost_per_replica(self) -> Optional[int]:
+        """GPU budget cost, falling back to the legacy engine width."""
+
+        if self.gpu_cost_per_replica is not None:
+            return self.gpu_cost_per_replica
+        return self.num_gpu
 
 
 @dataclass

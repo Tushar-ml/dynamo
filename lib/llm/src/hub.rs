@@ -8,22 +8,85 @@ use hf_hub::Cache;
 use modelexpress_client::{
     Client as MxClient, ClientConfig as MxClientConfig, ModelProvider as MxModelProvider,
 };
-use modelexpress_common::download as mx;
+use modelexpress_common::{cache as mx_cache, download as mx, envs as mx_envs};
 
 use dynamo_runtime::config::environment_names::model as env_model;
 
-/// Check if a model is already cached in the HuggingFace hub cache directory.
+mod huggingface;
+
+pub(crate) use huggingface::{
+    HfRepoSpec, cached_hf_snapshot, download_hf_snapshot, finalize_hf_snapshot, huggingface_cache,
+};
+
+const NGC_URI_PREFIX: &str = "ngc://";
+
+fn provider_for(model_name: &str) -> MxModelProvider {
+    if model_name.starts_with(NGC_URI_PREFIX) {
+        MxModelProvider::Ngc
+    } else {
+        MxModelProvider::HuggingFace
+    }
+}
+
+/// Check if a model is already cached locally with the files needed to serve it.
 /// Returns the path to the cached model directory if found, None otherwise.
 ///
-/// Uses hf-hub's Cache API to check for cached files. For tokenizer-only downloads
-/// (ignore_weights=true), we check for config.json and tokenizer files.
-/// For full downloads, we also require weight files to be present.
-fn get_cached_model_path(model_name: &str, ignore_weights: bool) -> Option<PathBuf> {
-    let cache = Cache::new(get_model_express_cache_dir());
-    let repo = cache.model(model_name.to_string());
+/// For tokenizer-only downloads (ignore_weights=true), we check for config.json and
+/// tokenizer files. For full downloads, we also require weight files to be present.
+fn get_cached_model_path(
+    model_name: &str,
+    provider: MxModelProvider,
+    ignore_weights: bool,
+) -> Option<PathBuf> {
+    let cache_dir = get_model_express_cache_dir(provider);
+    match provider {
+        MxModelProvider::HuggingFace => {
+            get_cached_model_path_in(model_name, ignore_weights, cache_dir)
+        }
+        _ => get_cached_provider_model_path_in(model_name, provider, ignore_weights, &cache_dir),
+    }
+}
 
-    // Check for required config file
-    let config_path = repo.get("config.json")?;
+fn get_cached_model_path_in(
+    model_name: &str,
+    ignore_weights: bool,
+    cache_dir: PathBuf,
+) -> Option<PathBuf> {
+    let cache = Cache::new(cache_dir);
+    let snapshot_path = cache
+        .model(model_name.to_string())
+        .get("config.json")?
+        .parent()?
+        .to_path_buf();
+    cached_model_dir(model_name, snapshot_path, ignore_weights)
+}
+
+/// Look up a model in a non-HuggingFace provider's cache. ModelExpress owns the layout.
+fn get_cached_provider_model_path_in(
+    model_name: &str,
+    provider: MxModelProvider,
+    ignore_weights: bool,
+    cache_dir: &Path,
+) -> Option<PathBuf> {
+    let model_dir = mx_cache::resolve_model_path(cache_dir, provider, model_name, None).ok()?;
+    cached_model_dir(model_name, model_dir, ignore_weights)
+}
+
+fn cached_model_dir(model_name: &str, dir: PathBuf, ignore_weights: bool) -> Option<PathBuf> {
+    if !has_required_model_files(&dir, ignore_weights) {
+        return None;
+    }
+    tracing::info!("Found cached model '{model_name}' at {dir:?}, skipping download");
+    Some(dir)
+}
+
+/// Require model config and tokenizer files, plus weights unless explicitly skipped.
+fn has_required_model_files(dir: &Path, ignore_weights: bool) -> bool {
+    let has = |filename: &str| dir.join(filename).exists();
+
+    if !has("config.json") {
+        return false;
+    }
 
     // Check for tokenizer files (at least one must exist). Only count
     // artifacts that ``ModelDeploymentCard::TokenizerKind::from_disk`` can
@@ -31,36 +94,19 @@ fn get_cached_model_path(model_name: &str, ignore_weights: bool) -> Option<PathB
     // tokenizer and cannot be used on its own, so a snapshot with only
     // ``config.json`` + ``tokenizer_config.json`` would fall through to a
     // download even though the cache appears "populated".
-    let has_tokenizer = repo.get("tokenizer.json").is_some()
-        || repo.get("tiktoken.model").is_some()
-        || has_tiktoken_file(config_path.parent()?);
-
+    let has_tokenizer = has("tokenizer.json") || has("tiktoken.model") || has_tiktoken_file(dir);
     if !has_tokenizer {
-        return None;
+        return false;
     }
 
     // For full downloads, check for weight files. When an index file is present,
     // verify the shard files it references are also cached — an index without its
     // shards is an incomplete cache that should fall through to download.
-    if !ignore_weights {
-        let has_weights = repo.get("model.safetensors").is_some()
-            || repo.get("pytorch_model.bin").is_some()
-            || repo
-                .get("model.safetensors.index.json")
-                .is_some_and(|p| shard_files_present(&p))
-            || repo
-                .get("pytorch_model.bin.index.json")
-                .is_some_and(|p| shard_files_present(&p));
-
-        if !has_weights {
-            return None;
-        }
-    }
-
-    // Return the parent directory (snapshot dir) containing the model files
-    let snapshot_path = config_path.parent()?.to_path_buf();
-    tracing::info!("Found cached model '{model_name}' at {snapshot_path:?}, skipping download");
-    Some(snapshot_path)
+    ignore_weights
+        || has("model.safetensors")
+        || has("pytorch_model.bin")
+        || shard_files_present(&dir.join("model.safetensors.index.json"))
+        || shard_files_present(&dir.join("pytorch_model.bin.index.json"))
 }
 
 /// Check if the snapshot directory contains any `*.tiktoken` file (e.g. `qwen.tiktoken`).
@@ -99,9 +145,7 @@ fn shard_files_present(index_path: &Path) -> bool {
 
 /// Check if offline mode is enabled via HF_HUB_OFFLINE environment variable.
 fn is_offline_mode() -> bool {
-    env::var(env_model::huggingface::HF_HUB_OFFLINE)
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    dynamo_runtime::config::env_is_truthy(env_model::huggingface::HF_HUB_OFFLINE)
 }
 
 /// Check if shared-storage mode is disabled via MODEL_EXPRESS_NO_SHARED_STORAGE.
@@ -110,25 +154,25 @@ fn is_offline_mode() -> bool {
 /// server and worker pods do not share a filesystem (e.g. RWO PVCs, cross-namespace
 /// deployments).
 fn is_no_shared_storage() -> bool {
-    env::var(env_model::model_express::MODEL_EXPRESS_NO_SHARED_STORAGE)
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    dynamo_runtime::config::env_is_truthy(env_model::model_express::MODEL_EXPRESS_NO_SHARED_STORAGE)
 }
 
 /// Download a model using ModelExpress client. The client first requests for the model
 /// from the server and fallbacks to direct download in case of server failure.
+/// `ngc://` names are downloaded from NGC; all other names are Hugging Face repos.
 /// If ignore_weights is true, model weight files will be skipped
 /// Returns the path to the model files
 ///
 /// If the model is already cached locally with the required files, returns the cached
-/// path without making any API calls to HuggingFace, regardless of HF_HUB_OFFLINE.
+/// path without making any network calls, regardless of HF_HUB_OFFLINE.
 pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Result<PathBuf> {
     let name = name.as_ref();
     let model_name = name.display().to_string();
+    let provider = provider_for(&model_name);
 
     // Cache-first in all modes: if the snapshot is already on disk with the files we
     // need, return it without touching the network.
-    if let Some(cached_path) = get_cached_model_path(&model_name, ignore_weights) {
+    if let Some(cached_path) = get_cached_model_path(&model_name, provider, ignore_weights) {
         return Ok(cached_path);
     }
 
@@ -139,6 +183,9 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     }
 
     let mut config: MxClientConfig = MxClientConfig::default();
+    if provider == MxModelProvider::Ngc {
+        config.cache.local_path = get_model_express_cache_dir(provider);
+    }
     if let Ok(endpoint) = env::var(env_model::model_express::MODEL_EXPRESS_URL) {
         config = config.with_endpoint(endpoint);
     }
@@ -150,26 +197,19 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
         Ok(mut client) => {
             tracing::info!("Successfully connected to ModelExpress server");
             match client
-                .request_model_with_provider_and_fallback(
-                    &model_name,
-                    MxModelProvider::HuggingFace,
-                    ignore_weights,
-                )
+                .request_model(&model_name, provider, ignore_weights)
                 .await
             {
                 Ok(()) => {
                     tracing::info!("Server download succeeded for model: {model_name}");
-                    match client
-                        .get_model_path(&model_name, MxModelProvider::HuggingFace)
-                        .await
-                    {
+                    match client.get_model_path(&model_name, provider).await {
                         Ok(path) => Ok(path),
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to resolve local model path after server download for '{model_name}': {e}. \
                                 Falling back to direct download."
                             );
-                            mx_download_direct(&model_name, ignore_weights).await
+                            mx_download_direct(&model_name, provider, ignore_weights).await
                         }
                     }
                 }
@@ -177,13 +217,13 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
                     tracing::warn!(
                         "Server download failed for model '{model_name}': {e}. Falling back to direct download."
                     );
-                    mx_download_direct(&model_name, ignore_weights).await
+                    mx_download_direct(&model_name, provider, ignore_weights).await
                 }
             }
         }
         Err(e) => {
             tracing::warn!("Cannot connect to ModelExpress server: {e}. Using direct download.");
-            mx_download_direct(&model_name, ignore_weights).await
+            mx_download_direct(&model_name, provider, ignore_weights).await
         }
     };
 
@@ -199,42 +239,51 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     }
 }
 
-// Direct download using the ModelExpress client.
-async fn mx_download_direct(model_name: &str, ignore_weights: bool) -> anyhow::Result<PathBuf> {
-    let cache_dir = get_model_express_cache_dir();
-    mx::download_model(
-        model_name,
-        MxModelProvider::HuggingFace,
-        Some(cache_dir),
-        ignore_weights,
-    )
-    .await
+async fn mx_download_direct(
+    model_name: &str,
+    provider: MxModelProvider,
+    ignore_weights: bool,
+) -> anyhow::Result<PathBuf> {
+    let cache_dir = get_model_express_cache_dir(provider);
+    mx::download_model(model_name, provider, Some(cache_dir), ignore_weights).await
 }
 
 // TODO: remove in the future. This is a temporary workaround to find common
 // cache directory between client and server.
-fn get_model_express_cache_dir() -> PathBuf {
-    // Check HF_HUB_CACHE environment variable
-    // reference: https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhubcache
-    if let Ok(cache_path) = env::var(env_model::huggingface::HF_HUB_CACHE) {
+fn get_model_express_cache_dir(provider: MxModelProvider) -> PathBuf {
+    if provider == MxModelProvider::Ngc {
+        // ModelExpress 0.6 adds the provider's `ngc/` layout beneath this root.
+        return mx_envs::cache_directory()
+            .unwrap_or_else(|| mx_envs::home_dir_or_cwd().join(".cache"));
+    }
+    cache_dir_from_values(
+        env::var(env_model::huggingface::HF_HUB_CACHE).ok(),
+        env::var(env_model::huggingface::HF_HOME).ok(),
+        env::var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH).ok(),
+        env::var("HOME").ok(),
+        env::var("USERPROFILE").ok(),
+    )
+}
+
+fn cache_dir_from_values(
+    hf_hub_cache: Option<String>,
+    hf_home: Option<String>,
+    model_express_cache: Option<String>,
+    home: Option<String>,
+    userprofile: Option<String>,
+) -> PathBuf {
+    if let Some(cache_path) = hf_hub_cache {
         return PathBuf::from(cache_path);
     }
-
-    // Check HF_HOME environment variable (standard Hugging Face cache directory)
-    // reference: https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhome
-    if let Ok(hf_home) = env::var(env_model::huggingface::HF_HOME) {
+    if let Some(hf_home) = hf_home {
         return PathBuf::from(hf_home).join("hub");
     }
-
-    if let Ok(cache_path) = env::var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH) {
+    if let Some(cache_path) = model_express_cache {
         return PathBuf::from(cache_path);
     }
 
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-
-    PathBuf::from(home).join(".cache/huggingface/hub")
+    PathBuf::from(home.or(userprofile).unwrap_or_else(|| ".".to_string()))
+        .join(".cache/huggingface/hub")
 }
 
 #[cfg(test)]
@@ -243,34 +292,52 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_from_hf_with_model_express() {
-        let test_path = PathBuf::from("test-model");
-        let _result: anyhow::Result<PathBuf> = from_hf(test_path, false).await;
-    }
-
-    #[test]
-    fn test_get_model_express_cache_dir() {
-        let cache_dir = get_model_express_cache_dir();
-        assert!(!cache_dir.to_string_lossy().is_empty());
-        assert!(cache_dir.is_absolute() || cache_dir.starts_with("."));
-    }
-
     #[serial_test::serial]
     #[test]
-    fn test_get_model_express_cache_dir_with_hf_home() {
-        // Test that HF_HOME is respected when set
-        unsafe {
-            // Clear other cache env vars to ensure HF_HOME is tested
-            env::remove_var(env_model::huggingface::HF_HUB_CACHE);
-            env::remove_var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH);
-            env::set_var(env_model::huggingface::HF_HOME, "/custom/cache/path");
-            let cache_dir = get_model_express_cache_dir();
-            assert_eq!(cache_dir, PathBuf::from("/custom/cache/path/hub"));
-
-            // Clean up
-            env::remove_var(env_model::huggingface::HF_HOME);
+    fn hf_offline_mode_accepts_huggingface_truthy_values() {
+        for value in ["1", "true", "TRUE", "on", "ON", "yes", "YES"] {
+            temp_env::with_var(env_model::huggingface::HF_HUB_OFFLINE, Some(value), || {
+                assert!(is_offline_mode(), "rejected {value}")
+            });
         }
+    }
+
+    #[test]
+    fn cache_dir_precedence_and_fallback() {
+        assert_eq!(
+            cache_dir_from_values(
+                Some("/hub-cache".to_string()),
+                Some("/hf-home".to_string()),
+                Some("/model-express".to_string()),
+                Some("/home".to_string()),
+                None,
+            ),
+            PathBuf::from("/hub-cache")
+        );
+        assert_eq!(
+            cache_dir_from_values(
+                None,
+                Some("/hf-home".to_string()),
+                Some("/model-express".to_string()),
+                Some("/home".to_string()),
+                None,
+            ),
+            PathBuf::from("/hf-home/hub")
+        );
+        assert_eq!(
+            cache_dir_from_values(
+                None,
+                None,
+                Some("/model-express".to_string()),
+                Some("/home".to_string()),
+                None,
+            ),
+            PathBuf::from("/model-express")
+        );
+        assert_eq!(
+            cache_dir_from_values(None, None, None, None, Some("/profile".to_string())),
+            PathBuf::from("/profile/.cache/huggingface/hub")
+        );
     }
 
     /// Build an hf-hub-format cache layout for `model_name` in `cache_root`,
@@ -290,59 +357,6 @@ mod tests {
         snapshot_dir
     }
 
-    /// Snapshot every cache-related env var and restore the exact prior state on Drop.
-    /// Use `EnvGuard::with_hub_cache(path)` to point HF_HUB_CACHE at a test directory
-    /// while ensuring no leak across tests (including the non-serial ones that read
-    /// these vars).
-    struct EnvGuard {
-        hub_cache: Option<String>,
-        hub_offline: Option<String>,
-        hf_home: Option<String>,
-        mx_cache_path: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn with_hub_cache(path: &Path) -> Self {
-            let guard = Self {
-                hub_cache: env::var(env_model::huggingface::HF_HUB_CACHE).ok(),
-                hub_offline: env::var(env_model::huggingface::HF_HUB_OFFLINE).ok(),
-                hf_home: env::var(env_model::huggingface::HF_HOME).ok(),
-                mx_cache_path: env::var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH).ok(),
-            };
-            unsafe {
-                env::set_var(env_model::huggingface::HF_HUB_CACHE, path.to_str().unwrap());
-                env::remove_var(env_model::huggingface::HF_HOME);
-                env::remove_var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH);
-                env::remove_var(env_model::huggingface::HF_HUB_OFFLINE);
-            }
-            guard
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                restore(env_model::huggingface::HF_HUB_CACHE, &self.hub_cache);
-                restore(env_model::huggingface::HF_HUB_OFFLINE, &self.hub_offline);
-                restore(env_model::huggingface::HF_HOME, &self.hf_home);
-                restore(
-                    env_model::model_express::MODEL_EXPRESS_CACHE_PATH,
-                    &self.mx_cache_path,
-                );
-            }
-        }
-    }
-
-    unsafe fn restore(key: &str, value: &Option<String>) {
-        unsafe {
-            match value {
-                Some(v) => env::set_var(key, v),
-                None => env::remove_var(key),
-            }
-        }
-    }
-
-    #[serial_test::serial]
     #[test]
     fn test_cached_path_metadata_only_satisfies_ignore_weights_true() {
         // A cache with only metadata files should satisfy ignore_weights=true
@@ -351,9 +365,8 @@ mod tests {
         let model = "test-org/metadata-only";
         let snapshot = build_hf_cache(temp.path(), model, &["config.json", "tokenizer.json"]);
 
-        let _guard = EnvGuard::with_hub_cache(temp.path());
-        let with_weights = get_cached_model_path(model, false);
-        let no_weights = get_cached_model_path(model, true);
+        let with_weights = get_cached_model_path_in(model, false, temp.path().to_path_buf());
+        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf());
 
         assert!(
             with_weights.is_none(),
@@ -366,7 +379,6 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[test]
     fn test_cached_path_full_cache_satisfies_both_modes() {
         let temp = TempDir::new().unwrap();
@@ -377,15 +389,13 @@ mod tests {
             &["config.json", "tokenizer.json", "model.safetensors"],
         );
 
-        let _guard = EnvGuard::with_hub_cache(temp.path());
-        let with_weights = get_cached_model_path(model, false);
-        let no_weights = get_cached_model_path(model, true);
+        let with_weights = get_cached_model_path_in(model, false, temp.path().to_path_buf());
+        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf());
 
         assert_eq!(with_weights.as_deref(), Some(snapshot.as_path()));
         assert_eq!(no_weights.as_deref(), Some(snapshot.as_path()));
     }
 
-    #[serial_test::serial]
     #[test]
     fn test_cached_path_sharded_requires_all_shard_files() {
         // A cache containing only `model.safetensors.index.json` (without the
@@ -400,9 +410,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = EnvGuard::with_hub_cache(temp.path());
-
-        let incomplete = get_cached_model_path(model, false);
+        let incomplete = get_cached_model_path_in(model, false, temp.path().to_path_buf());
         assert!(
             incomplete.is_none(),
             "sharded cache without shard files must NOT satisfy ignore_weights=false"
@@ -410,11 +418,10 @@ mod tests {
 
         fs::write(snapshot.join("model-00001-of-00002.safetensors"), "").unwrap();
         fs::write(snapshot.join("model-00002-of-00002.safetensors"), "").unwrap();
-        let complete = get_cached_model_path(model, false);
+        let complete = get_cached_model_path_in(model, false, temp.path().to_path_buf());
         assert_eq!(complete.as_deref(), Some(snapshot.as_path()));
     }
 
-    #[serial_test::serial]
     #[test]
     fn test_cached_path_rejects_tokenizer_config_without_real_tokenizer() {
         // A snapshot with only ``config.json`` and ``tokenizer_config.json``
@@ -431,14 +438,12 @@ mod tests {
             &["config.json", "tokenizer_config.json"],
         );
 
-        let _guard = EnvGuard::with_hub_cache(temp.path());
-
         assert!(
-            get_cached_model_path(model, true).is_none(),
+            get_cached_model_path_in(model, true, temp.path().to_path_buf()).is_none(),
             "tokenizer_config.json alone must NOT satisfy ignore_weights=true",
         );
         assert!(
-            get_cached_model_path(model, false).is_none(),
+            get_cached_model_path_in(model, false, temp.path().to_path_buf()).is_none(),
             "tokenizer_config.json alone must NOT satisfy ignore_weights=false",
         );
     }
@@ -457,13 +462,125 @@ mod tests {
             &["config.json", "tokenizer.json", "model.safetensors"],
         );
 
-        let _guard = EnvGuard::with_hub_cache(temp.path());
-        let result = from_hf(PathBuf::from(model), false).await;
+        temp_env::async_with_vars(
+            [
+                (
+                    env_model::huggingface::HF_HUB_CACHE,
+                    Some(temp.path().to_str().unwrap()),
+                ),
+                (env_model::huggingface::HF_HUB_OFFLINE, None),
+                (env_model::huggingface::HF_HOME, None),
+                (env_model::model_express::MODEL_EXPRESS_CACHE_PATH, None),
+            ],
+            async {
+                let result = from_hf(PathBuf::from(model), false).await;
 
+                assert_eq!(
+                    result.ok().as_deref(),
+                    Some(snapshot.as_path()),
+                    "from_hf must return cached path in online mode without network"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn provider_for_routes_ngc_uris_to_ngc() {
         assert_eq!(
-            result.ok().as_deref(),
-            Some(snapshot.as_path()),
-            "from_hf must return cached path in online mode without network"
+            provider_for("ngc://nvstaging/nim/nemotron-3-ultra:hf-rl-052726-nvfp4-e9744cc"),
+            MxModelProvider::Ngc
         );
+        assert_eq!(
+            provider_for("Qwen/Qwen3-0.6B"),
+            MxModelProvider::HuggingFace
+        );
+        assert_eq!(
+            provider_for("/data/llms/Qwen3-0.6B"),
+            MxModelProvider::HuggingFace
+        );
+    }
+
+    const NGC_TEST_MODEL: &str = "ngc://test-org/test-team/test-model:v1";
+
+    fn build_ngc_cache(cache_root: &Path, files: &[&str]) -> PathBuf {
+        let model_dir = cache_root.join("ngc/test-org/test-team/models/test-model/v1");
+        fs::create_dir_all(&model_dir).unwrap();
+        for f in files {
+            fs::write(model_dir.join(f), "{}").unwrap();
+        }
+        model_dir
+    }
+
+    #[test]
+    fn test_ngc_cached_path_requires_weights_for_full_download() {
+        let temp = TempDir::new().unwrap();
+        let model_dir = build_ngc_cache(temp.path(), &["config.json", "tokenizer.json"]);
+        let lookup = |ignore_weights: bool| {
+            get_cached_provider_model_path_in(
+                NGC_TEST_MODEL,
+                MxModelProvider::Ngc,
+                ignore_weights,
+                temp.path(),
+            )
+        };
+
+        assert!(
+            lookup(false).is_none(),
+            "NGC cache without weights must NOT satisfy ignore_weights=false"
+        );
+        assert_eq!(lookup(true).as_deref(), Some(model_dir.as_path()));
+
+        fs::write(model_dir.join("model.safetensors"), "").unwrap();
+        assert_eq!(lookup(false).as_deref(), Some(model_dir.as_path()));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn test_from_hf_ngc_cache_first() {
+        for explicit_cache in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let hf_cache = temp.path().join("hf");
+            let cache_root = if explicit_cache {
+                temp.path().join("mx")
+            } else {
+                home.join(".cache")
+            };
+            let model_dir = build_ngc_cache(
+                &cache_root,
+                &["config.json", "tokenizer.json", "model.safetensors"],
+            );
+
+            temp_env::async_with_vars(
+                [
+                    (
+                        mx_envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+                        explicit_cache.then(|| cache_root.to_str().unwrap()),
+                    ),
+                    (mx_envs::HOME, home.to_str()),
+                    (env_model::huggingface::HF_HUB_CACHE, hf_cache.to_str()),
+                    (env_model::huggingface::HF_HOME, hf_cache.to_str()),
+                    (
+                        env_model::model_express::MODEL_EXPRESS_CACHE_PATH,
+                        hf_cache.to_str(),
+                    ),
+                ],
+                async {
+                    assert_eq!(
+                        get_cached_model_path(NGC_TEST_MODEL, MxModelProvider::Ngc, false)
+                            .as_deref(),
+                        Some(model_dir.as_path())
+                    );
+                    assert_eq!(
+                        get_model_express_cache_dir(MxModelProvider::HuggingFace),
+                        hf_cache
+                    );
+                    let result = from_hf(PathBuf::from(NGC_TEST_MODEL), false).await;
+                    assert_eq!(result.ok().as_deref(), Some(model_dir.as_path()));
+                },
+            )
+            .await;
+        }
     }
 }
